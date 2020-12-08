@@ -15,13 +15,23 @@
 #include "access/tupconvert.h"
 #include "catalog/partition.h"
 #include "catalog/pg_publication.h"
+#include "catalog/pg_publication_rel.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "executor/executor.h"
 #include "fmgr.h"
 #include "replication/logical.h"
+#include "nodes/execnodes.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/planner.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
 #include "replication/logicalproto.h"
+#include "replication/logicalrelation.h"
 #include "replication/origin.h"
 #include "replication/pgoutput.h"
 #include "utils/int8.h"
+#include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -98,6 +108,7 @@ typedef struct RelationSyncEntry
 
 	bool		replicate_valid;
 	PublicationActions pubactions;
+	List       *qual;
 
 	/*
 	 * OID of the relation to publish changes as.  For a partition, this may
@@ -536,6 +547,68 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			Assert(false);
 	}
 
+	elog(WARNING, "list_length(relentry->qual): %d", list_length(relentry->qual));
+	/* ... then check row filter */
+	if (list_length(relentry->qual) > 0)
+	{
+		elog(WARNING, "pgoutput_change list_length(relentry->qual) > 0");
+
+		HeapTuple	old_tuple;
+		HeapTuple	new_tuple;
+		TupleDesc	tupdesc;
+		EState	   *estate;
+		ExprContext *ecxt;
+		MemoryContext oldcxt;
+		ListCell   *lc;
+		bool		matched = true;
+
+		old_tuple = change->data.tp.oldtuple ? &change->data.tp.oldtuple->tuple : NULL;
+		new_tuple = change->data.tp.newtuple ? &change->data.tp.newtuple->tuple : NULL;
+		tupdesc = RelationGetDescr(relation);
+		estate = create_estate_for_relation(relation);
+
+		/* prepare context per tuple */
+		ecxt = GetPerTupleExprContext(estate);
+		oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+		ecxt->ecxt_scantuple = ExecInitExtraTupleSlot(estate, tupdesc, &TTSOpsHeapTuple);
+
+		ExecStoreHeapTuple(new_tuple ? new_tuple : old_tuple, ecxt->ecxt_scantuple, false);
+
+		foreach(lc, relentry->qual)
+		{
+			Node	   *qual;
+			ExprState  *expr_state;
+			Expr	   *expr;
+			Oid			expr_type;
+			Datum		res;
+			bool		isnull;
+
+			qual = (Node *) lfirst(lc);
+
+			/* evaluates row filter */
+			expr_type = exprType(qual);
+			expr = (Expr *) coerce_to_target_type(NULL, qual, expr_type, BOOLOID, -1, COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+			expr = expression_planner(expr);
+			expr_state = ExecInitExpr(expr, NULL);
+			res = ExecEvalExpr(expr_state, ecxt, &isnull);
+
+			/* if tuple does not match row filter, bail out */
+			if (!DatumGetBool(res) || isnull)
+			{
+				matched = false;
+				break;
+			}
+		}
+
+		MemoryContextSwitchTo(oldcxt);
+
+		ExecDropSingleTupleTableSlot(ecxt->ecxt_scantuple);
+		FreeExecutorState(estate);
+
+		if (!matched)
+			return;
+	}
+
 	/* Avoid leaking memory by using and resetting our own context */
 	old = MemoryContextSwitchTo(data->context);
 
@@ -960,7 +1033,9 @@ get_rel_sync_entry(PGOutputData *data, Oid relid)
 		entry->replicate_valid = false;
 		entry->pubactions.pubinsert = entry->pubactions.pubupdate =
 			entry->pubactions.pubdelete = entry->pubactions.pubtruncate = false;
+		entry->qual = NIL;
 		entry->publish_as_relid = InvalidOid;
+		elog(WARNING, "create an entry: %d", relid);
 	}
 
 	/* Validate the entry */
@@ -990,6 +1065,9 @@ get_rel_sync_entry(PGOutputData *data, Oid relid)
 		foreach(lc, data->publications)
 		{
 			Publication *pub = lfirst(lc);
+			HeapTuple       rf_tuple;
+			Datum           rf_datum;
+			bool            rf_isnull;
 			bool		publish = false;
 
 			if (pub->alltables)
@@ -998,11 +1076,11 @@ get_rel_sync_entry(PGOutputData *data, Oid relid)
 				if (pub->pubviaroot && am_partition)
 					publish_as_relid = llast_oid(get_partition_ancestors(relid));
 			}
+			bool		ancestor_published = false;
+			Oid 		ancestorOid = InvalidOid;
 
 			if (!publish)
 			{
-				bool		ancestor_published = false;
-
 				/*
 				 * For a partition, check if any of the ancestors are
 				 * published.  If so, note down the topmost ancestor that is
@@ -1027,13 +1105,19 @@ get_rel_sync_entry(PGOutputData *data, Oid relid)
 						{
 							ancestor_published = true;
 							if (pub->pubviaroot)
+							{
 								publish_as_relid = ancestor;
+							}
+
+							ancestorOid = ancestor;
 						}
 					}
 				}
 
 				if (list_member_oid(pubids, pub->oid) || ancestor_published)
+				{
 					publish = true;
+				}
 			}
 
 			/*
@@ -1050,9 +1134,24 @@ get_rel_sync_entry(PGOutputData *data, Oid relid)
 				entry->pubactions.pubtruncate |= pub->pubactions.pubtruncate;
 			}
 
-			if (entry->pubactions.pubinsert && entry->pubactions.pubupdate &&
-				entry->pubactions.pubdelete && entry->pubactions.pubtruncate)
-				break;
+			/* Cache row filters, if available */
+			Oid relToUse = ancestor_published ? ancestorOid : relid;
+			rf_tuple = SearchSysCache2(PUBLICATIONRELMAP, ObjectIdGetDatum(relToUse), ObjectIdGetDatum(pub->oid));
+			if (HeapTupleIsValid(rf_tuple))
+			{
+				rf_datum = SysCacheGetAttr(PUBLICATIONRELMAP, rf_tuple, Anum_pg_publication_rel_prqual, &rf_isnull);
+
+				if (!rf_isnull)
+				{
+					MemoryContext oldctx = MemoryContextSwitchTo(CacheMemoryContext);
+					char	   *s = TextDatumGetCString(rf_datum);
+					Node	   *rf_node = stringToNode(s);
+
+					entry->qual = lappend(entry->qual, rf_node);
+					MemoryContextSwitchTo(oldctx);
+				}
+				ReleaseSysCache(rf_tuple);
+			}
 		}
 
 		list_free(pubids);
@@ -1173,5 +1272,10 @@ rel_sync_cache_publication_cb(Datum arg, int cacheid, uint32 hashvalue)
 	 */
 	hash_seq_init(&status, RelationSyncCache);
 	while ((entry = (RelationSyncEntry *) hash_seq_search(&status)) != NULL)
+	{
 		entry->replicate_valid = false;
+		if (list_length(entry->qual) > 0)
+			list_free_deep(entry->qual);
+		entry->qual = NIL;
+	}
 }

@@ -631,19 +631,26 @@ copy_read_data(void *outbuf, int minread, int maxread)
 
 /*
  * Get information about remote relation in similar fashion the RELATION
- * message provides during replication.
+ * message provides during replication. This function also returns the relation
++  * qualifications to be used in COPY.
  */
 static void
 fetch_remote_table_info(char *nspname, char *relname,
-						LogicalRepRelation *lrel)
+						LogicalRepRelation *lrel,  List **qual)
 {
 	WalRcvExecResult *res;
 	StringInfoData cmd;
 	TupleTableSlot *slot;
 	Oid			tableRow[] = {OIDOID, CHAROID, CHAROID};
 	Oid			attrRow[] = {TEXTOID, OIDOID, BOOLOID};
+	Oid         qualRow[1] = {TEXTOID};
 	bool		isnull;
-	int			natt;
+	int			n;
+	ListCell   *lc;
+	bool            first;
+
+	/* Avoid trashing relation map cache */
+	memset(lrel, 0, sizeof(LogicalRepRelation));
 
 	lrel->nspname = nspname;
 	lrel->relname = relname;
@@ -708,20 +715,20 @@ fetch_remote_table_info(char *nspname, char *relname,
 	lrel->atttyps = palloc0(res->ntuples * sizeof(Oid));
 	lrel->attkeys = NULL;
 
-	natt = 0;
+	n = 0;
 	slot = MakeSingleTupleTableSlot(res->tupledesc, &TTSOpsMinimalTuple);
 	while (tuplestore_gettupleslot(res->tuplestore, true, false, slot))
 	{
-		lrel->attnames[natt] =
+		lrel->attnames[n] =
 			TextDatumGetCString(slot_getattr(slot, 1, &isnull));
 		Assert(!isnull);
-		lrel->atttyps[natt] = DatumGetObjectId(slot_getattr(slot, 2, &isnull));
+		lrel->atttyps[n] = DatumGetObjectId(slot_getattr(slot, 2, &isnull));
 		Assert(!isnull);
 		if (DatumGetBool(slot_getattr(slot, 3, &isnull)))
-			lrel->attkeys = bms_add_member(lrel->attkeys, natt);
+			lrel->attkeys = bms_add_member(lrel->attkeys, n);
 
 		/* Should never happen. */
-		if (++natt >= MaxTupleAttributeNumber)
+		if (++n >= MaxTupleAttributeNumber)
 			elog(ERROR, "too many columns in remote table \"%s.%s\"",
 				 nspname, relname);
 
@@ -729,10 +736,86 @@ fetch_remote_table_info(char *nspname, char *relname,
 	}
 	ExecDropSingleTupleTableSlot(slot);
 
-	lrel->natts = natt;
+	lrel->natts = n;
+
+	walrcv_clear_result(res);
+
+	/* Get relation qual */
+	resetStringInfo(&cmd);
+	appendStringInfo(&cmd,
+						"SELECT pg_get_expr(prqual, prrelid) "
+						"  FROM pg_publication p "
+						"  INNER JOIN pg_publication_rel pr "
+						"       ON (p.oid = pr.prpubid) "
+						" WHERE pr.prrelid = %u "
+						"   AND p.pubname IN (", lrel->remoteid);
+
+	first = true;
+	foreach(lc, MySubscription->publications)
+	{
+		char	   *pubname = strVal(lfirst(lc));
+
+		if (first)
+			first = false;
+		else
+			appendStringInfoString(&cmd, ", ");
+
+		appendStringInfoString(&cmd, quote_literal_cstr(pubname));
+	}
+	appendStringInfoChar(&cmd, ')');
+
+	res = walrcv_exec(wrconn, cmd.data, 1, qualRow);
+
+	if (res->status != WALRCV_OK_TUPLES)
+		ereport(ERROR,
+				(errmsg("could not fetch relation qualifications for table \"%s.%s\" from publisher: %s",
+						nspname, relname, res->err)));
+
+	slot = MakeSingleTupleTableSlot(res->tupledesc, &TTSOpsMinimalTuple);
+	while (tuplestore_gettupleslot(res->tuplestore, true, false, slot))
+	{
+		Datum		rf = slot_getattr(slot, 1, &isnull);
+
+		if (!isnull)
+			*qual = lappend(*qual, makeString(TextDatumGetCString(rf)));
+
+		ExecClearTuple(slot);
+	}
+	ExecDropSingleTupleTableSlot(slot);
 
 	walrcv_clear_result(res);
 	pfree(cmd.data);
+}
+
+static char *
+TableQualToText(List *qual)
+{
+	StringInfoData cmd;
+	ListCell *lc;
+	bool first = true;
+
+	if (qual == NIL)
+	{
+		elog(WARNING, " cmd.data:TRUE");
+
+		return "true";
+	}
+
+	initStringInfo(&cmd);
+
+	foreach(lc, qual)
+	{
+		char	   *q = strVal(lfirst(lc));
+
+		if (first)
+			first = false;
+		else
+			appendStringInfoString(&cmd, " OR ");
+		appendStringInfo(&cmd, "%s", q);
+	}
+	elog(WARNING, " cmd.data:%s",  cmd.data);
+
+	return cmd.data;
 }
 
 /*
@@ -745,6 +828,7 @@ copy_table(Relation rel)
 {
 	LogicalRepRelMapEntry *relmapentry;
 	LogicalRepRelation lrel;
+	List	   *qual = NIL;
 	WalRcvExecResult *res;
 	StringInfoData cmd;
 	CopyFromState cstate;
@@ -753,7 +837,8 @@ copy_table(Relation rel)
 
 	/* Get the publisher relation info. */
 	fetch_remote_table_info(get_namespace_name(RelationGetNamespace(rel)),
-							RelationGetRelationName(rel), &lrel);
+							RelationGetRelationName(rel), &lrel, &qual);
+	elog(WARNING, "copy_table is called: %s Qual list: %d", RelationGetRelationName(rel), list_length(qual));
 
 	/* Put the relation into relmap. */
 	logicalrep_relmap_update(&lrel);
@@ -762,16 +847,22 @@ copy_table(Relation rel)
 	relmapentry = logicalrep_rel_open(lrel.remoteid, NoLock);
 	Assert(rel == relmapentry->localrel);
 
+	/* list of columns for COPY */
+	attnamelist = make_copy_attnamelist(relmapentry);
+
 	/* Start copy on the publisher. */
 	initStringInfo(&cmd);
-	if (lrel.relkind == RELKIND_RELATION)
+	if (lrel.relkind == RELKIND_RELATION && qual == NIL)
 		appendStringInfo(&cmd, "COPY %s TO STDOUT",
 						 quote_qualified_identifier(lrel.nspname, lrel.relname));
 	else
 	{
+		elog(WARNING, "else is called");
+
 		/*
-		 * For non-tables, we need to do COPY (SELECT ...), but we can't just
-		 * do SELECT * because we need to not copy generated columns.
+		 * For non-tables or tables with quals, we need to do
+		 * COPY (SELECT ...), but we can't just do SELECT * because
+		 * we need to not copy generated columns.
 		 */
 		appendStringInfoString(&cmd, "COPY (SELECT ");
 		for (int i = 0; i < lrel.natts; i++)
@@ -780,9 +871,14 @@ copy_table(Relation rel)
 			if (i < lrel.natts - 1)
 				appendStringInfoString(&cmd, ", ");
 		}
-		appendStringInfo(&cmd, " FROM %s) TO STDOUT",
-						 quote_qualified_identifier(lrel.nspname, lrel.relname));
+		appendStringInfo(&cmd, " FROM %s WHERE %s) TO STDOUT",
+						 quote_qualified_identifier(lrel.nspname, lrel.relname),
+						 TableQualToText(qual));
 	}
+
+	/* we don't need quals anymore */
+	list_free_deep(qual);
+
 	res = walrcv_exec(wrconn, cmd.data, 0, NULL);
 	pfree(cmd.data);
 	if (res->status != WALRCV_OK_COPY_OUT)
@@ -797,7 +893,6 @@ copy_table(Relation rel)
 	(void) addRangeTableEntryForRelation(pstate, rel, AccessShareLock,
 										 NULL, false, false);
 
-	attnamelist = make_copy_attnamelist(relmapentry);
 	cstate = BeginCopyFrom(pstate, rel, NULL, NULL, false, copy_read_data, attnamelist, NIL);
 
 	/* Do the copy */
@@ -805,6 +900,7 @@ copy_table(Relation rel)
 
 	logicalrep_rel_close(relmapentry, NoLock);
 }
+
 
 /*
  * Start syncing the table in the sync worker.

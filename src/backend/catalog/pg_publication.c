@@ -33,6 +33,11 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+
+#include "parser/parse_clause.h"
+#include "parser/parse_collate.h"
+#include "parser/parse_relation.h"
+
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -41,6 +46,9 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+static List * PublicationPartitionedRelationGetRelations(Oid relationId,
+														PublicationPartOpt pub_partopt);
 
 /*
  * Check if relation can be in given publication and throws appropriate
@@ -141,18 +149,22 @@ pg_relation_is_publishable(PG_FUNCTION_ARGS)
  * Insert new publication / relation mapping.
  */
 ObjectAddress
-publication_add_relation(Oid pubid, Relation targetrel,
+publication_add_relation(Oid pubid, PublicationRelationQual *targetrel,
 						 bool if_not_exists)
 {
 	Relation	rel;
 	HeapTuple	tup;
 	Datum		values[Natts_pg_publication_rel];
 	bool		nulls[Natts_pg_publication_rel];
-	Oid			relid = RelationGetRelid(targetrel);
+	Oid			relid = RelationGetRelid(targetrel->relation);
 	Oid			prrelid;
 	Publication *pub = GetPublication(pubid);
 	ObjectAddress myself,
 				referenced;
+	ParseState *pstate;
+	RangeTblEntry *rte;
+	Node	   *whereclause;
+	ParseNamespaceItem *pitem;
 
 	rel = table_open(PublicationRelRelationId, RowExclusiveLock);
 
@@ -172,10 +184,41 @@ publication_add_relation(Oid pubid, Relation targetrel,
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("relation \"%s\" is already member of publication \"%s\"",
-						RelationGetRelationName(targetrel), pub->name)));
+						RelationGetRelationName(targetrel->relation), pub->name)));
 	}
 
-	check_publication_add_relation(targetrel);
+	check_publication_add_relation(targetrel->relation);
+
+	if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE && !pub->pubviaroot &&
+		targetrel->whereClause)
+	{
+		table_close(rel, RowExclusiveLock);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("cannot create publication  \"%s\" with WHERE clause on partitioned table "
+						 "\"%s\" without publish_via_partition_root is true", pub->name,
+						RelationGetRelationName(targetrel->relation))));
+	}
+
+	/* Set up a pstate to parse with */
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = nodeToString(targetrel->whereClause);
+
+	pitem = addRangeTableEntryForRelation(pstate, targetrel->relation,
+										AccessShareLock,
+										NULL, false, false);
+	rte = pitem->p_rte;
+
+	addNSItemToQuery(pstate, pitem, false, true, true);
+
+	whereclause = transformWhereClause(pstate,
+									   copyObject(targetrel->whereClause),
+									   EXPR_KIND_PUBLICATION_WHERE,
+									   "PUBLICATION");
+
+	/* Fix up collation information */
+	assign_expr_collations(pstate, whereclause);
 
 	/* Form a tuple. */
 	memset(values, 0, sizeof(values));
@@ -188,6 +231,12 @@ publication_add_relation(Oid pubid, Relation targetrel,
 		ObjectIdGetDatum(pubid);
 	values[Anum_pg_publication_rel_prrelid - 1] =
 		ObjectIdGetDatum(relid);
+
+	/* Add qualifications, if available */
+	if (whereclause)
+		values[Anum_pg_publication_rel_prqual - 1] = CStringGetTextDatum(nodeToString(whereclause));
+	else
+		nulls[Anum_pg_publication_rel_prqual - 1] = true;
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -205,11 +254,17 @@ publication_add_relation(Oid pubid, Relation targetrel,
 	ObjectAddressSet(referenced, RelationRelationId, relid);
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
 
+	/* Add dependency on the objects mentioned in the qualifications */
+	if (whereclause)
+		recordDependencyOnExpr(&myself, whereclause, pstate->p_rtable, DEPENDENCY_NORMAL);
+
+	free_parsestate(pstate);
+
 	/* Close the table. */
 	table_close(rel, RowExclusiveLock);
 
 	/* Invalidate relcache so that publication info is rebuilt. */
-	CacheInvalidateRelcache(targetrel);
+	CacheInvalidateRelcache(targetrel->relation);
 
 	return myself;
 }
@@ -271,31 +326,14 @@ GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
 
 		pubrel = (Form_pg_publication_rel) GETSTRUCT(tup);
 
-		if (get_rel_relkind(pubrel->prrelid) == RELKIND_PARTITIONED_TABLE &&
-			pub_partopt != PUBLICATION_PART_ROOT)
-		{
-			List	   *all_parts = find_all_inheritors(pubrel->prrelid, NoLock,
-														NULL);
-
-			if (pub_partopt == PUBLICATION_PART_ALL)
-				result = list_concat(result, all_parts);
-			else if (pub_partopt == PUBLICATION_PART_LEAF)
-			{
-				ListCell   *lc;
-
-				foreach(lc, all_parts)
-				{
-					Oid			partOid = lfirst_oid(lc);
-
-					if (get_rel_relkind(partOid) != RELKIND_PARTITIONED_TABLE)
-						result = lappend_oid(result, partOid);
-				}
-			}
-			else
-				Assert(false);
-		}
-		else
+		if (get_rel_relkind(pubrel->prrelid) != RELKIND_PARTITIONED_TABLE)
 			result = lappend_oid(result, pubrel->prrelid);
+		else
+		{
+			List	   *all_parts = PublicationPartitionedRelationGetRelations(pubrel->prrelid, pub_partopt);
+
+			result = list_concat(result, all_parts);
+		}
 	}
 
 	systable_endscan(scan);
@@ -303,6 +341,129 @@ GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
 
 	return result;
 }
+
+
+/*
+ * For the input partitionedRelationId and pub_partopt, return list of relations
+ * that should be used for the publication.
+ *
+ */
+static List *
+PublicationPartitionedRelationGetRelations(Oid partitionedRelationId,
+										  PublicationPartOpt pub_partopt)
+{
+	AssertArg(get_rel_relkind(partitionedRelationId) == RELKIND_PARTITIONED_TABLE);
+
+	List *result = NIL;
+	List	   *all_parts = NIL;
+	if (pub_partopt == PUBLICATION_PART_ROOT)
+		return list_make1_oid(partitionedRelationId);
+
+	all_parts = find_all_inheritors(partitionedRelationId, NoLock, NULL);
+	if (pub_partopt == PUBLICATION_PART_ALL)
+		result = list_concat(result, all_parts);
+	else if (pub_partopt == PUBLICATION_PART_LEAF)
+	{
+		ListCell   *lc;
+
+		foreach(lc, all_parts)
+		{
+			Oid			partOid = lfirst_oid(lc);
+
+			if (get_rel_relkind(partOid) != RELKIND_PARTITIONED_TABLE)
+			{
+				result = lappend_oid(result, partOid);
+			}
+		}
+	}
+
+	return result;
+}
+
+
+/*
+ * Gets list of PublicationRelationQuals for a publication.
+ *
+ * This should only be used for normal publications, the FOR ALL TABLES
+ * the WHERE clause cannot be used, hence this function should not be
+ * called.
+ */
+List *
+GetPublicationRelationQuals(Oid pubid, PublicationPartOpt pub_partopt)
+{
+	List	   *result;
+	Relation	pubrelsrel;
+	ScanKeyData scankey;
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	/* Find all publications associated with the relation. */
+	pubrelsrel = table_open(PublicationRelRelationId, AccessShareLock);
+
+	ScanKeyInit(&scankey,
+				Anum_pg_publication_rel_prpubid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(pubid));
+
+	scan = systable_beginscan(pubrelsrel, PublicationRelPrrelidPrpubidIndexId,
+							  true, NULL, 1, &scankey);
+
+	result = NIL;
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_publication_rel pubrel;
+		Datum		value_datum;
+		char	   *qual_value;
+		Node	   *qual_expr;
+		bool		isnull;
+
+		pubrel = (Form_pg_publication_rel) GETSTRUCT(tup);
+
+		value_datum = heap_getattr(tup, Anum_pg_publication_rel_prqual, RelationGetDescr(pubrelsrel), &isnull);
+		if (!isnull)
+		{
+			qual_value = TextDatumGetCString(value_datum);
+			qual_expr = (Node *) stringToNode(qual_value);
+		}
+		else
+			qual_expr = NULL;
+
+		pubrel = (Form_pg_publication_rel) GETSTRUCT(tup);
+
+		if (get_rel_relkind(pubrel->prrelid) != RELKIND_PARTITIONED_TABLE)
+		{
+			PublicationRelationQual *relqual = palloc(sizeof(PublicationRelationQual));
+			relqual->relation = table_open(pubrel->prrelid, ShareUpdateExclusiveLock);
+			relqual->whereClause = copyObject(qual_expr);
+
+			result = lappend(result, relqual);
+		}
+		else
+		{
+			List	   *all_parts =
+				PublicationPartitionedRelationGetRelations(pubrel->prrelid, pub_partopt);
+			ListCell   *lc;
+
+			foreach(lc, all_parts)
+			{
+				Oid			partOid = lfirst_oid(lc);
+
+				PublicationRelationQual *relqual = palloc(sizeof(PublicationRelationQual));
+				relqual->relation = table_open(partOid, NoLock);
+
+				/* for all partitions, use the same qual */
+				relqual->whereClause = copyObject(qual_expr);
+				result = lappend(result, relqual);
+			}
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(pubrelsrel, AccessShareLock);
+
+	return result;
+}
+
 
 /*
  * Gets list of publication oids for publications marked as FOR ALL TABLES.

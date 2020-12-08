@@ -5609,6 +5609,15 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        The expression tree to be added to the WITH CHECK qualifications for queries that attempt to add rows to the table
       </para></entry>
      </row>
+
+     <row>
+      <entry><structfield>prqual</structfield></entry>
+      <entry><type>pg_node_tree</type></entry>
+      <entry></entry>
+      <entry>Expression tree (in the form of a
+      <function>nodeToString()</function> representation) for the relation's
+      qualifying condition</entry>
+     </row>
     </tbody>
    </tgroup>
   </table>
