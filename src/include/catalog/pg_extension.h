@@ -4,7 +4,7 @@
  *	  definition of the "extension" system catalog (pg_extension)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_extension.h
@@ -48,5 +48,12 @@ CATALOG(pg_extension,3079,ExtensionRelationId)
  * ----------------
  */
 typedef FormData_pg_extension *Form_pg_extension;
+
+DECLARE_TOAST(pg_extension, 4147, 4148);
+
+DECLARE_UNIQUE_INDEX(pg_extension_oid_index, 3080, on pg_extension using btree(oid oid_ops));
+#define ExtensionOidIndexId 3080
+DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081, on pg_extension using btree(extname name_ops));
+#define ExtensionNameIndexId 3081
 
 #endif							/* PG_EXTENSION_H */

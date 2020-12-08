@@ -8,7 +8,7 @@
  *	  Structs that need to be client-visible are in pqcomm.h.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/libpq/libpq-be.h
@@ -71,7 +71,7 @@ typedef struct
 typedef enum CAC_state
 {
 	CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY,
-	CAC_WAITBACKUP
+	CAC_SUPERUSER
 } CAC_state;
 
 
@@ -285,6 +285,12 @@ extern void be_tls_get_peer_serial(Port *port, char *ptr, size_t len);
 #if defined(USE_OPENSSL) && defined(HAVE_X509_GET_SIGNATURE_NID)
 #define HAVE_BE_TLS_GET_CERTIFICATE_HASH
 extern char *be_tls_get_certificate_hash(Port *port, size_t *len);
+#endif
+
+/* init hook for SSL, the default sets the password callback if appropriate */
+#ifdef USE_OPENSSL
+typedef void (*openssl_tls_init_hook_typ) (SSL_CTX *context, bool isServerStart);
+extern PGDLLIMPORT openssl_tls_init_hook_typ openssl_tls_init_hook;
 #endif
 
 #endif							/* USE_SSL */

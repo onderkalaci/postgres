@@ -9,7 +9,7 @@
  * in cluster.c.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,6 +42,7 @@
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgworker_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
@@ -68,6 +69,14 @@ static MemoryContext vac_context = NULL;
 static BufferAccessStrategy vac_strategy;
 
 
+/*
+ * Variables for cost-based parallel vacuum.  See comments atop
+ * compute_parallel_delay to understand how it works.
+ */
+pg_atomic_uint32 *VacuumSharedCostBalance = NULL;
+pg_atomic_uint32 *VacuumActiveNWorkers = NULL;
+int			VacuumCostBalanceLocal = 0;
+
 /* non-export function prototypes */
 static List *expand_vacuum_rel(VacuumRelation *vrel, int options);
 static List *get_all_vacuum_rels(int options);
@@ -76,6 +85,7 @@ static void vac_truncate_clog(TransactionId frozenXID,
 							  TransactionId lastSaneFrozenXid,
 							  MultiXactId lastSaneMinMulti);
 static bool vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params);
+static double compute_parallel_delay(void);
 static VacOptTernaryValue get_vacopt_ternary_value(DefElem *def);
 
 /*
@@ -99,6 +109,9 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	/* Set default value */
 	params.index_cleanup = VACOPT_TERNARY_DEFAULT;
 	params.truncate = VACOPT_TERNARY_DEFAULT;
+
+	/* By default parallel vacuum is enabled */
+	params.nworkers = 0;
 
 	/* Parse options list */
 	foreach(lc, vacstmt->options)
@@ -129,6 +142,38 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 			params.index_cleanup = get_vacopt_ternary_value(opt);
 		else if (strcmp(opt->defname, "truncate") == 0)
 			params.truncate = get_vacopt_ternary_value(opt);
+		else if (strcmp(opt->defname, "parallel") == 0)
+		{
+			if (opt->arg == NULL)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("parallel option requires a value between 0 and %d",
+								MAX_PARALLEL_WORKER_LIMIT),
+						 parser_errposition(pstate, opt->location)));
+			}
+			else
+			{
+				int			nworkers;
+
+				nworkers = defGetInt32(opt);
+				if (nworkers < 0 || nworkers > MAX_PARALLEL_WORKER_LIMIT)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("parallel vacuum degree must be between 0 and %d",
+									MAX_PARALLEL_WORKER_LIMIT),
+							 parser_errposition(pstate, opt->location)));
+
+				/*
+				 * Disable parallel vacuum, if user has specified parallel
+				 * degree as zero.
+				 */
+				if (nworkers == 0)
+					params.nworkers = -1;
+				else
+					params.nworkers = nworkers;
+			}
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -151,6 +196,11 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	Assert((params.options & VACOPT_VACUUM) ||
 		   !(params.options & (VACOPT_FULL | VACOPT_FREEZE)));
 	Assert(!(params.options & VACOPT_SKIPTOAST));
+
+	if ((params.options & VACOPT_FULL) && params.nworkers > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("VACUUM FULL cannot be performed in parallel")));
 
 	/*
 	 * Make sure VACOPT_ANALYZE is specified if any column lists are present.
@@ -383,6 +433,9 @@ vacuum(List *relations, VacuumParams *params,
 		VacuumPageHit = 0;
 		VacuumPageMiss = 0;
 		VacuumPageDirty = 0;
+		VacuumCostBalanceLocal = 0;
+		VacuumSharedCostBalance = NULL;
+		VacuumActiveNWorkers = NULL;
 
 		/*
 		 * Loop to process each selected relation.
@@ -854,6 +907,8 @@ get_all_vacuum_rels(int options)
 /*
  * vacuum_set_xid_limits() -- compute oldestXmin and freeze cutoff points
  *
+ * Input parameters are the target relation, applicable freeze age settings.
+ *
  * The output parameters are:
  * - oldestXmin is the cutoff value used to distinguish whether tuples are
  *	 DEAD or RECENTLY_DEAD (see HeapTupleSatisfiesVacuum).
@@ -896,14 +951,32 @@ vacuum_set_xid_limits(Relation rel,
 	/*
 	 * We can always ignore processes running lazy vacuum.  This is because we
 	 * use these values only for deciding which tuples we must keep in the
-	 * tables.  Since lazy vacuum doesn't write its XID anywhere, it's safe to
-	 * ignore it.  In theory it could be problematic to ignore lazy vacuums in
-	 * a full vacuum, but keep in mind that only one vacuum process can be
-	 * working on a particular table at any time, and that each vacuum is
-	 * always an independent transaction.
+	 * tables.  Since lazy vacuum doesn't write its XID anywhere (usually no
+	 * XID assigned), it's safe to ignore it.  In theory it could be
+	 * problematic to ignore lazy vacuums in a full vacuum, but keep in mind
+	 * that only one vacuum process can be working on a particular table at
+	 * any time, and that each vacuum is always an independent transaction.
 	 */
-	*oldestXmin =
-		TransactionIdLimitedForOldSnapshots(GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM), rel);
+	*oldestXmin = GetOldestNonRemovableTransactionId(rel);
+
+	if (OldSnapshotThresholdActive())
+	{
+		TransactionId limit_xmin;
+		TimestampTz limit_ts;
+
+		if (TransactionIdLimitedForOldSnapshots(*oldestXmin, rel,
+												&limit_xmin, &limit_ts))
+		{
+			/*
+			 * TODO: We should only set the threshold if we are pruning on the
+			 * basis of the increased limits.  Not as crucial here as it is
+			 * for opportunistic pruning (which often happens at a much higher
+			 * frequency), but would still be a significant improvement.
+			 */
+			SetOldSnapshotThresholdTimestamp(limit_ts, limit_xmin);
+			*oldestXmin = limit_xmin;
+		}
+	}
 
 	Assert(TransactionIdIsNormal(*oldestXmin));
 
@@ -1058,8 +1131,8 @@ vacuum_set_xid_limits(Relation rel,
  *		live tuples seen; but if we did not, we should not blindly extrapolate
  *		from that number, since VACUUM may have scanned a quite nonrandom
  *		subset of the table.  When we have only partial information, we take
- *		the old value of pg_class.reltuples as a measurement of the
- *		tuple density in the unscanned pages.
+ *		the old value of pg_class.reltuples/pg_class.relpages as a measurement
+ *		of the tuple density in the unscanned pages.
  *
  *		Note: scanned_tuples should count only *live* tuples, since
  *		pg_class.reltuples is defined that way.
@@ -1082,18 +1155,16 @@ vac_estimate_reltuples(Relation relation,
 
 	/*
 	 * If scanned_pages is zero but total_pages isn't, keep the existing value
-	 * of reltuples.  (Note: callers should avoid updating the pg_class
-	 * statistics in this situation, since no new information has been
-	 * provided.)
+	 * of reltuples.  (Note: we might be returning -1 in this case.)
 	 */
 	if (scanned_pages == 0)
 		return old_rel_tuples;
 
 	/*
-	 * If old value of relpages is zero, old density is indeterminate; we
-	 * can't do much except scale up scanned_tuples to match total_pages.
+	 * If old density is unknown, we can't do much except scale up
+	 * scanned_tuples to match total_pages.
 	 */
-	if (old_rel_pages == 0)
+	if (old_rel_tuples < 0 || old_rel_pages == 0)
 		return floor((scanned_tuples / scanned_pages) * total_pages + 0.5);
 
 	/*
@@ -1290,14 +1361,24 @@ vac_update_datfrozenxid(void)
 	MultiXactId lastSaneMinMulti;
 	bool		bogus = false;
 	bool		dirty = false;
+	ScanKeyData key[1];
 
 	/*
-	 * Initialize the "min" calculation with GetOldestXmin, which is a
-	 * reasonable approximation to the minimum relfrozenxid for not-yet-
-	 * committed pg_class entries for new tables; see AddNewRelationTuple().
-	 * So we cannot produce a wrong minimum by starting with this.
+	 * Restrict this task to one backend per database.  This avoids race
+	 * conditions that would move datfrozenxid or datminmxid backward.  It
+	 * avoids calling vac_truncate_clog() with a datfrozenxid preceding a
+	 * datfrozenxid passed to an earlier vac_truncate_clog() call.
 	 */
-	newFrozenXid = GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM);
+	LockDatabaseFrozenIds(ExclusiveLock);
+
+	/*
+	 * Initialize the "min" calculation with
+	 * GetOldestNonRemovableTransactionId(), which is a reasonable
+	 * approximation to the minimum relfrozenxid for not-yet-committed
+	 * pg_class entries for new tables; see AddNewRelationTuple().  So we
+	 * cannot produce a wrong minimum by starting with this.
+	 */
+	newFrozenXid = GetOldestNonRemovableTransactionId(NULL);
 
 	/*
 	 * Similarly, initialize the MultiXact "min" with the value that would be
@@ -1399,10 +1480,25 @@ vac_update_datfrozenxid(void)
 	/* Now fetch the pg_database tuple we need to update. */
 	relation = table_open(DatabaseRelationId, RowExclusiveLock);
 
-	/* Fetch a copy of the tuple to scribble on */
-	tuple = SearchSysCacheCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	/*
+	 * Get the pg_database tuple to scribble on.  Note that this does not
+	 * directly rely on the syscache to avoid issues with flattened toast
+	 * values for the in-place update.
+	 */
+	ScanKeyInit(&key[0],
+				Anum_pg_database_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(MyDatabaseId));
+
+	scan = systable_beginscan(relation, DatabaseOidIndexId, true,
+							  NULL, 1, key);
+	tuple = systable_getnext(scan);
+	tuple = heap_copytuple(tuple);
+	systable_endscan(scan);
+
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "could not find tuple for database %u", MyDatabaseId);
+
 	dbform = (Form_pg_database) GETSTRUCT(tuple);
 
 	/*
@@ -1479,6 +1575,9 @@ vac_truncate_clog(TransactionId frozenXID,
 	Oid			minmulti_datoid;
 	bool		bogus = false;
 	bool		frozenAlreadyWrapped = false;
+
+	/* Restrict task to one backend per cluster; see SimpleLruTruncate(). */
+	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 
 	/* init oldest datoids to sync with my frozenXID/minMulti values */
 	oldestxid_datoid = MyDatabaseId;
@@ -1585,10 +1684,12 @@ vac_truncate_clog(TransactionId frozenXID,
 	 * Update the wrap limit for GetNewTransactionId and creation of new
 	 * MultiXactIds.  Note: these functions will also signal the postmaster
 	 * for an(other) autovac cycle if needed.   XXX should we avoid possibly
-	 * signalling twice?
+	 * signaling twice?
 	 */
 	SetTransactionIdLimit(frozenXID, oldestxid_datoid);
 	SetMultiXactIdLimit(minMulti, minmulti_datoid, false);
+
+	LWLockRelease(WrapLimitsVacuumLock);
 }
 
 
@@ -1627,12 +1728,6 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 	/* Begin a transaction for vacuuming this relation */
 	StartTransactionCommand();
 
-	/*
-	 * Functions in indexes may want a snapshot set.  Also, setting a snapshot
-	 * ensures that RecentGlobalXmin is kept truly recent.
-	 */
-	PushActiveSnapshot(GetTransactionSnapshot());
-
 	if (!(params->options & VACOPT_FULL))
 	{
 		/*
@@ -1652,15 +1747,25 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 		 *
 		 * Note: these flags remain set until CommitTransaction or
 		 * AbortTransaction.  We don't want to clear them until we reset
-		 * MyPgXact->xid/xmin, else OldestXmin might appear to go backwards,
-		 * which is probably Not Good.
+		 * MyProc->xid/xmin, otherwise GetOldestNonRemovableTransactionId()
+		 * might appear to go backwards, which is probably Not Good.  (We also
+		 * set PROC_IN_VACUUM *before* taking our own snapshot, so that our
+		 * xmin doesn't become visible ahead of setting the flag.)
 		 */
 		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-		MyPgXact->vacuumFlags |= PROC_IN_VACUUM;
+		MyProc->statusFlags |= PROC_IN_VACUUM;
 		if (params->is_wraparound)
-			MyPgXact->vacuumFlags |= PROC_VACUUM_FOR_WRAPAROUND;
+			MyProc->statusFlags |= PROC_VACUUM_FOR_WRAPAROUND;
+		ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
 		LWLockRelease(ProcArrayLock);
 	}
+
+	/*
+	 * Need to acquire a snapshot to prevent pg_subtrans from being truncated,
+	 * cutoff xids in local memory wrapping around, and to have updated xmin
+	 * horizons.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/*
 	 * Check for user-requested abort.  Note we want this to be inside a
@@ -1844,7 +1949,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 
 	/*
 	 * If the relation has a secondary toast rel, vacuum that too while we
-	 * still hold the session lock on the master table.  Note however that
+	 * still hold the session lock on the main table.  Note however that
 	 * "analyze" will not get done on the toast table.  This is good, because
 	 * the toaster always uses hardcoded index access and statistics are
 	 * totally unimportant for toast relations.
@@ -1853,7 +1958,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 		vacuum_rel(toast_relid, NULL, params);
 
 	/*
-	 * Now release the session-level lock on the master table.
+	 * Now release the session-level lock on the main table.
 	 */
 	UnlockRelationIdForSession(&onerelid, lmode);
 
@@ -1941,20 +2046,32 @@ vac_close_indexes(int nindexes, Relation *Irel, LOCKMODE lockmode)
 void
 vacuum_delay_point(void)
 {
+	double		msec = 0;
+
 	/* Always check for interrupts */
 	CHECK_FOR_INTERRUPTS();
 
-	/* Nap if appropriate */
-	if (VacuumCostActive && !InterruptPending &&
-		VacuumCostBalance >= VacuumCostLimit)
-	{
-		double		msec;
+	if (!VacuumCostActive || InterruptPending)
+		return;
 
+	/*
+	 * For parallel vacuum, the delay is computed based on the shared cost
+	 * balance.  See compute_parallel_delay.
+	 */
+	if (VacuumSharedCostBalance != NULL)
+		msec = compute_parallel_delay();
+	else if (VacuumCostBalance >= VacuumCostLimit)
 		msec = VacuumCostDelay * VacuumCostBalance / VacuumCostLimit;
+
+	/* Nap if appropriate */
+	if (msec > 0)
+	{
 		if (msec > VacuumCostDelay * 4)
 			msec = VacuumCostDelay * 4;
 
+		pgstat_report_wait_start(WAIT_EVENT_VACUUM_DELAY);
 		pg_usleep((long) (msec * 1000));
+		pgstat_report_wait_end();
 
 		VacuumCostBalance = 0;
 
@@ -1964,6 +2081,66 @@ vacuum_delay_point(void)
 		/* Might have gotten an interrupt while sleeping */
 		CHECK_FOR_INTERRUPTS();
 	}
+}
+
+/*
+ * Computes the vacuum delay for parallel workers.
+ *
+ * The basic idea of a cost-based delay for parallel vacuum is to allow each
+ * worker to sleep in proportion to the share of work it's done.  We achieve this
+ * by allowing all parallel vacuum workers including the leader process to
+ * have a shared view of cost related parameters (mainly VacuumCostBalance).
+ * We allow each worker to update it as and when it has incurred any cost and
+ * then based on that decide whether it needs to sleep.  We compute the time
+ * to sleep for a worker based on the cost it has incurred
+ * (VacuumCostBalanceLocal) and then reduce the VacuumSharedCostBalance by
+ * that amount.  This avoids putting to sleep those workers which have done less
+ * I/O than other workers and therefore ensure that workers
+ * which are doing more I/O got throttled more.
+ *
+ * We allow a worker to sleep only if it has performed I/O above a certain
+ * threshold, which is calculated based on the number of active workers
+ * (VacuumActiveNWorkers), and the overall cost balance is more than
+ * VacuumCostLimit set by the system.  Testing reveals that we achieve
+ * the required throttling if we force a worker that has done more than 50%
+ * of its share of work to sleep.
+ */
+static double
+compute_parallel_delay(void)
+{
+	double		msec = 0;
+	uint32		shared_balance;
+	int			nworkers;
+
+	/* Parallel vacuum must be active */
+	Assert(VacuumSharedCostBalance);
+
+	nworkers = pg_atomic_read_u32(VacuumActiveNWorkers);
+
+	/* At least count itself */
+	Assert(nworkers >= 1);
+
+	/* Update the shared cost balance value atomically */
+	shared_balance = pg_atomic_add_fetch_u32(VacuumSharedCostBalance, VacuumCostBalance);
+
+	/* Compute the total local balance for the current worker */
+	VacuumCostBalanceLocal += VacuumCostBalance;
+
+	if ((shared_balance >= VacuumCostLimit) &&
+		(VacuumCostBalanceLocal > 0.5 * ((double) VacuumCostLimit / nworkers)))
+	{
+		/* Compute sleep time based on the local cost balance */
+		msec = VacuumCostDelay * VacuumCostBalanceLocal / VacuumCostLimit;
+		pg_atomic_sub_fetch_u32(VacuumSharedCostBalance, VacuumCostBalanceLocal);
+		VacuumCostBalanceLocal = 0;
+	}
+
+	/*
+	 * Reset the local balance as we accumulated it into the shared value.
+	 */
+	VacuumCostBalance = 0;
+
+	return msec;
 }
 
 /*

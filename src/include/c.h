@@ -9,7 +9,7 @@
  *	  polluting the namespace with lots of stuff...
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/c.h
@@ -64,9 +64,7 @@
 #ifdef HAVE_STRINGS_H
 #include <strings.h>
 #endif
-#ifdef HAVE_STDINT_H
 #include <stdint.h>
-#endif
 #include <sys/types.h>
 #include <errno.h>
 #if defined(WIN32) || defined(__CYGWIN__)
@@ -100,16 +98,38 @@
  *
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Function-Attributes.html
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
+ * Clang: https://clang.llvm.org/docs/AttributeReference.html
  * Sunpro: https://docs.oracle.com/cd/E18659_01/html/821-1384/gjzke.html
  * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/function_attributes.html
  * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/type_attrib.html
  */
+
+/*
+ * For compilers which don't support __has_attribute, we just define
+ * __has_attribute(x) to 0 so that we can define macros for various
+ * __attribute__s more easily below.
+ */
+#ifndef __has_attribute
+#define __has_attribute(attribute) 0
+#endif
 
 /* only GCC supports the unused attribute */
 #ifdef __GNUC__
 #define pg_attribute_unused() __attribute__((unused))
 #else
 #define pg_attribute_unused()
+#endif
+
+/*
+ * pg_nodiscard means the compiler should warn if the result of a function
+ * call is ignored.  The name "nodiscard" is chosen in alignment with
+ * (possibly future) C and C++ standards.  For maximum compatibility, use it
+ * as a function declaration specifier, so it goes before the return type.
+ */
+#ifdef __GNUC__
+#define pg_nodiscard __attribute__((warn_unused_result))
+#else
+#define pg_nodiscard
 #endif
 
 /*
@@ -180,6 +200,39 @@
 #define pg_noinline
 #endif
 
+/*
+ * For now, just define pg_attribute_cold and pg_attribute_hot to be empty
+ * macros on minGW 8.1.  There appears to be a compiler bug that results in
+ * compilation failure.  At this time, we still have at least one buildfarm
+ * animal running that compiler, so this should make that green again. It's
+ * likely this compiler is not popular enough to warrant keeping this code
+ * around forever, so let's just remove it once the last buildfarm animal
+ * upgrades.
+ */
+#if defined(__MINGW64__) && __GNUC__ == 8 && __GNUC_MINOR__ == 1
+
+#define pg_attribute_cold
+#define pg_attribute_hot
+
+#else
+/*
+ * Marking certain functions as "hot" or "cold" can be useful to assist the
+ * compiler in arranging the assembly code in a more efficient way.
+ */
+#if __has_attribute (cold)
+#define pg_attribute_cold __attribute__((cold))
+#else
+#define pg_attribute_cold
+#endif
+
+#if __has_attribute (hot)
+#define pg_attribute_hot __attribute__((hot))
+#else
+#define pg_attribute_hot
+#endif
+
+#endif							/* defined(__MINGW64__) && __GNUC__ == 8 &&
+								 * __GNUC_MINOR__ == 1 */
 /*
  * Mark a point as unreachable in a portable fashion.  This should preferably
  * be something that the compiler understands, to aid code generation.
@@ -266,6 +319,23 @@
 #else
 #define dummyret	char
 #endif
+
+/*
+ * Generic function pointer.  This can be used in the rare cases where it's
+ * necessary to cast a function pointer to a seemingly incompatible function
+ * pointer type while avoiding gcc's -Wcast-function-type warnings.
+ */
+typedef void (*pg_funcptr_t) (void);
+
+/*
+ * We require C99, hence the compiler should understand flexible array
+ * members.  However, for documentation purposes we still consider it to be
+ * project style to write "field[FLEXIBLE_ARRAY_MEMBER]" not just "field[]".
+ * When computing the size of such an object, use "offsetof(struct s, f)"
+ * for portability.  Don't use "offsetof(struct s, f[0])", as this doesn't
+ * work with MSVC and with C++ compilers.
+ */
+#define FLEXIBLE_ARRAY_MEMBER	/* empty */
 
 /* Which __func__ symbol do we have, if any? */
 #ifdef HAVE_FUNCNAME__FUNC
@@ -429,8 +499,8 @@ typedef unsigned PG_INT128_TYPE uint128
 #endif
 
 /*
- * stdint.h limits aren't guaranteed to be present and aren't guaranteed to
- * have compatible types with our fixed width types. So just define our own.
+ * stdint.h limits aren't guaranteed to have compatible types with our fixed
+ * width types. So just define our own.
  */
 #define PG_INT8_MIN		(-0x7F-1)
 #define PG_INT8_MAX		(0x7F)
@@ -444,15 +514,6 @@ typedef unsigned PG_INT128_TYPE uint128
 #define PG_INT64_MIN	(-INT64CONST(0x7FFFFFFFFFFFFFFF) - 1)
 #define PG_INT64_MAX	INT64CONST(0x7FFFFFFFFFFFFFFF)
 #define PG_UINT64_MAX	UINT64CONST(0xFFFFFFFFFFFFFFFF)
-
-/* Max value of size_t might also be missing if we don't have stdint.h */
-#ifndef SIZE_MAX
-#if SIZEOF_SIZE_T == 8
-#define SIZE_MAX PG_UINT64_MAX
-#else
-#define SIZE_MAX PG_UINT32_MAX
-#endif
-#endif
 
 /*
  * We now always use int64 timestamps, but keep this symbol defined for the
@@ -490,6 +551,12 @@ typedef signed int Offset;
  */
 typedef float float4;
 typedef double float8;
+
+#ifdef USE_FLOAT8_BYVAL
+#define FLOAT8PASSBYVAL true
+#else
+#define FLOAT8PASSBYVAL false
+#endif
 
 /*
  * Oid, RegProcedure, TransactionId, SubTransactionId, MultiXactId,
@@ -826,8 +893,10 @@ extern void ExceptionalCondition(const char *conditionName,
  * throw a compile error using the "errmessage" (a string literal).
  *
  * gcc 4.6 and up supports _Static_assert(), but there are bizarre syntactic
- * placement restrictions.  These macros make it safe to use as a statement
- * or in an expression, respectively.
+ * placement restrictions.  Macros StaticAssertStmt() and StaticAssertExpr()
+ * make it safe to use as a statement or in an expression, respectively.
+ * The macro StaticAssertDecl() is suitable for use at file scope (outside of
+ * any function).
  *
  * Otherwise we fall back on a kluge that assumes the compiler will complain
  * about a negative width for a struct bit-field.  This will not include a
@@ -839,11 +908,15 @@ extern void ExceptionalCondition(const char *conditionName,
 	do { _Static_assert(condition, errmessage); } while(0)
 #define StaticAssertExpr(condition, errmessage) \
 	((void) ({ StaticAssertStmt(condition, errmessage); true; }))
+#define StaticAssertDecl(condition, errmessage) \
+	_Static_assert(condition, errmessage)
 #else							/* !HAVE__STATIC_ASSERT */
 #define StaticAssertStmt(condition, errmessage) \
 	((void) sizeof(struct { int static_assert_failure : (condition) ? 1 : -1; }))
 #define StaticAssertExpr(condition, errmessage) \
 	StaticAssertStmt(condition, errmessage)
+#define StaticAssertDecl(condition, errmessage) \
+	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
 #endif							/* HAVE__STATIC_ASSERT */
 #else							/* C++ */
 #if defined(__cpp_static_assert) && __cpp_static_assert >= 200410
@@ -851,12 +924,16 @@ extern void ExceptionalCondition(const char *conditionName,
 	static_assert(condition, errmessage)
 #define StaticAssertExpr(condition, errmessage) \
 	({ static_assert(condition, errmessage); })
-#else
+#define StaticAssertDecl(condition, errmessage) \
+	static_assert(condition, errmessage)
+#else							/* !__cpp_static_assert */
 #define StaticAssertStmt(condition, errmessage) \
 	do { struct static_assert_struct { int static_assert_failure : (condition) ? 1 : -1; }; } while(0)
 #define StaticAssertExpr(condition, errmessage) \
 	((void) ({ StaticAssertStmt(condition, errmessage); }))
-#endif
+#define StaticAssertDecl(condition, errmessage) \
+	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
+#endif							/* __cpp_static_assert */
 #endif							/* C++ */
 
 
@@ -909,35 +986,6 @@ extern void ExceptionalCondition(const char *conditionName,
  *		Return the absolute value of the argument.
  */
 #define Abs(x)			((x) >= 0 ? (x) : -(x))
-
-/*
- * StrNCpy
- *	Like standard library function strncpy(), except that result string
- *	is guaranteed to be null-terminated --- that is, at most N-1 bytes
- *	of the source string will be kept.
- *	Also, the macro returns no result (too hard to do that without
- *	evaluating the arguments multiple times, which seems worse).
- *
- *	BTW: when you need to copy a non-null-terminated string (like a text
- *	datum) and add a null, do not do it with StrNCpy(..., len+1).  That
- *	might seem to work, but it fetches one byte more than there is in the
- *	text object.  One fine day you'll have a SIGSEGV because there isn't
- *	another byte before the end of memory.  Don't laugh, we've had real
- *	live bug reports from real live users over exactly this mistake.
- *	Do it honestly with "memcpy(dst,src,len); dst[len] = '\0';", instead.
- */
-#define StrNCpy(dst,src,len) \
-	do \
-	{ \
-		char * _dst = (dst); \
-		Size _len = (len); \
-\
-		if (_len > 0) \
-		{ \
-			strncpy(_dst, (src), _len); \
-			_dst[_len-1] = '\0'; \
-		} \
-	} while (0)
 
 
 /* Get a bit mask of the bits set in non-long aligned addresses */
@@ -1061,6 +1109,10 @@ extern void ExceptionalCondition(const char *conditionName,
  * ----------------------------------------------------------------
  */
 
+#ifdef HAVE_STRUCT_SOCKADDR_UN
+#define HAVE_UNIX_SOCKETS 1
+#endif
+
 /*
  * Invert the sign of a qsort-style comparison result, ie, exchange negative
  * and positive integer values, being careful not to get the wrong answer
@@ -1114,8 +1166,6 @@ typedef union PGAlignedXLogBlock
 #define STATUS_OK				(0)
 #define STATUS_ERROR			(-1)
 #define STATUS_EOF				(-2)
-#define STATUS_FOUND			(1)
-#define STATUS_WAITING			(2)
 
 /*
  * gettext support
@@ -1137,7 +1187,8 @@ typedef union PGAlignedXLogBlock
  *	access to the original string and translated string, and for cases where
  *	immediate translation is not possible, like when initializing global
  *	variables.
- *		http://www.gnu.org/software/autoconf/manual/gettext/Special-cases.html
+ *
+ *	https://www.gnu.org/software/gettext/manual/html_node/Special-cases.html
  */
 #define gettext_noop(x) (x)
 
@@ -1255,10 +1306,6 @@ extern long long strtoll(const char *str, char **endptr, int base);
 
 #if defined(HAVE_STRTOULL) && !HAVE_DECL_STRTOULL
 extern unsigned long long strtoull(const char *str, char **endptr, int base);
-#endif
-
-#if !defined(HAVE_MEMMOVE) && !defined(memmove)
-#define memmove(d, s, c)		bcopy(s, d, c)
 #endif
 
 /* no special DLL markers on most ports */

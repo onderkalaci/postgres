@@ -32,7 +32,7 @@
  *	  clients.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -105,13 +105,13 @@
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
-#include "miscadmin.h"
 #include "pg_getopt.h"
 #include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/fork_process.h"
+#include "postmaster/interrupt.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -148,36 +148,38 @@
 #define BACKEND_TYPE_BGWORKER	0x0008	/* bgworker process */
 #define BACKEND_TYPE_ALL		0x000F	/* OR of all the above */
 
-#define BACKEND_TYPE_WORKER		(BACKEND_TYPE_AUTOVAC | BACKEND_TYPE_BGWORKER)
-
 /*
  * List of active backends (or child processes anyway; we don't actually
  * know whether a given child has become a backend or is still in the
  * authorization phase).  This is used mainly to keep track of how many
  * children we have and send them appropriate signals when necessary.
  *
- * "Special" children such as the startup, bgwriter and autovacuum launcher
- * tasks are not in this list.  Autovacuum worker and walsender are in it.
+ * As shown in the above set of backend types, this list includes not only
+ * "normal" client sessions, but also autovacuum workers, walsenders, and
+ * background workers.  (Note that at the time of launch, walsenders are
+ * labeled BACKEND_TYPE_NORMAL; we relabel them to BACKEND_TYPE_WALSND
+ * upon noticing they've changed their PMChildFlags entry.  Hence that check
+ * must be done before any operation that needs to distinguish walsenders
+ * from normal backends.)
+ *
  * Also, "dead_end" children are in it: these are children launched just for
  * the purpose of sending a friendly rejection message to a would-be client.
  * We must track them because they are attached to shared memory, but we know
  * they will never become live backends.  dead_end children are not assigned a
- * PMChildSlot.
+ * PMChildSlot.  dead_end children have bkend_type NORMAL.
  *
- * Background workers are in this list, too.
+ * "Special" children such as the startup, bgwriter and autovacuum launcher
+ * tasks are not in this list.  They are tracked via StartupPID and other
+ * pid_t variables below.  (Thus, there can't be more than one of any given
+ * "special" child process type.  We use BackendList entries for any child
+ * process there can be more than one of.)
  */
 typedef struct bkend
 {
 	pid_t		pid;			/* process id of backend */
 	int32		cancel_key;		/* cancel key for cancels for this backend */
 	int			child_slot;		/* PMChildSlot for this backend, if any */
-
-	/*
-	 * Flavor of backend or auxiliary process.  Note that BACKEND_TYPE_WALSND
-	 * backends initially announce themselves as BACKEND_TYPE_NORMAL, so if
-	 * bkend_type is normal, you should check for a recent transition.
-	 */
-	int			bkend_type;
+	int			bkend_type;		/* child process flavor, see above */
 	bool		dead_end;		/* is it going to send an error and quit? */
 	bool		bgworker_notify;	/* gets bgworker start/stop notifications */
 	dlist_node	elem;			/* list link in BackendList */
@@ -216,12 +218,6 @@ int			ReservedBackends;
 /* The socket(s) we're listening to. */
 #define MAXLISTEN	64
 static pgsocket ListenSocket[MAXLISTEN];
-
-/*
- * Set by the -o option
- */
-static char ExtraOptions[MAXPGPATH];
-
 /*
  * These globals control the behavior of the postmaster in case some
  * backend dumps core.  Normally, it kills all peers of the dead backend
@@ -300,8 +296,7 @@ static bool FatalError = false; /* T if recovering from backend crash */
  * and we switch to PM_RUN state.
  *
  * Normal child backends can only be launched when we are in PM_RUN or
- * PM_HOT_STANDBY state.  (We also allow launch of normal
- * child backends in PM_WAIT_BACKUP state, but only for superusers.)
+ * PM_HOT_STANDBY state.  (connsAllowed can also restrict launching.)
  * In other states we handle connection requests by launching "dead_end"
  * child processes, which will simply send the client an error message and
  * quit.  (We track these in the BackendList so that we can know when they
@@ -315,10 +310,10 @@ static bool FatalError = false; /* T if recovering from backend crash */
  *
  * Notice that this state variable does not distinguish *why* we entered
  * states later than PM_RUN --- Shutdown and FatalError must be consulted
- * to find that out.  FatalError is never true in PM_RECOVERY_* or PM_RUN
- * states, nor in PM_SHUTDOWN states (because we don't enter those states
- * when trying to recover from a crash).  It can be true in PM_STARTUP state,
- * because we don't clear it until we've successfully started WAL redo.
+ * to find that out.  FatalError is never true in PM_RECOVERY, PM_HOT_STANDBY,
+ * or PM_RUN states, nor in PM_SHUTDOWN states (because we don't enter those
+ * states when trying to recover from a crash).  It can be true in PM_STARTUP
+ * state, because we don't clear it until we've successfully started WAL redo.
  */
 typedef enum
 {
@@ -327,8 +322,7 @@ typedef enum
 	PM_RECOVERY,				/* in archive recovery mode */
 	PM_HOT_STANDBY,				/* in hot standby mode */
 	PM_RUN,						/* normal "database is alive" state */
-	PM_WAIT_BACKUP,				/* waiting for online backup mode to end */
-	PM_WAIT_READONLY,			/* waiting for read only backends to exit */
+	PM_STOP_BACKENDS,			/* need to stop remaining backends */
 	PM_WAIT_BACKENDS,			/* waiting for live backends to exit */
 	PM_SHUTDOWN,				/* waiting for checkpointer to do shutdown
 								 * ckpt */
@@ -339,6 +333,21 @@ typedef enum
 } PMState;
 
 static PMState pmState = PM_INIT;
+
+/*
+ * While performing a "smart shutdown", we restrict new connections but stay
+ * in PM_RUN or PM_HOT_STANDBY state until all the client backends are gone.
+ * connsAllowed is a sub-state indicator showing the active restriction.
+ * It is of no interest unless pmState is PM_RUN or PM_HOT_STANDBY.
+ */
+typedef enum
+{
+	ALLOW_ALL_CONNS,			/* normal not-shutting-down state */
+	ALLOW_SUPERUSER_CONNS,		/* only superusers can connect */
+	ALLOW_NO_CONNS				/* no new connections allowed, period */
+} ConnsAllowedState;
+
+static ConnsAllowedState connsAllowed = ALLOW_ALL_CONNS;
 
 /* Start time of SIGKILL timeout during immediate shutdown or child crash */
 /* Zero means timeout is not running */
@@ -357,7 +366,7 @@ bool		redirection_done = false;	/* stderr redirected for syslogger? */
 /* received START_AUTOVAC_LAUNCHER signal */
 static volatile sig_atomic_t start_autovac_launcher = false;
 
-/* the launcher needs to be signalled to communicate some condition */
+/* the launcher needs to be signaled to communicate some condition */
 static volatile bool avlauncher_needs_signal = false;
 
 /* received START_WALRECEIVER signal */
@@ -390,7 +399,7 @@ static void SIGHUP_handler(SIGNAL_ARGS);
 static void pmdie(SIGNAL_ARGS);
 static void reaper(SIGNAL_ARGS);
 static void sigusr1_handler(SIGNAL_ARGS);
-static void startup_die(SIGNAL_ARGS);
+static void process_startup_packet_die(SIGNAL_ARGS);
 static void dummy_handler(SIGNAL_ARGS);
 static void StartupPacketTimeoutHandler(void);
 static void CleanupBackend(int pid, int exitstatus);
@@ -404,7 +413,7 @@ static void BackendRun(Port *port) pg_attribute_noreturn();
 static void ExitPostmaster(int status) pg_attribute_noreturn();
 static int	ServerLoop(void);
 static int	BackendStartup(Port *port);
-static int	ProcessStartupPacket(Port *port, bool secure_done);
+static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
 static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void processCancelRequest(Port *port, void *pkt);
 static int	initMasks(fd_set *rmask);
@@ -521,7 +530,6 @@ typedef struct
 #endif
 	char		my_exec_path[MAXPGPATH];
 	char		pkglib_path[MAXPGPATH];
-	char		ExtraOptions[MAXPGPATH];
 } BackendParameters;
 
 static void read_backend_variables(char *id, Port *port);
@@ -678,7 +686,7 @@ PostmasterMain(int argc, char *argv[])
 	 * tcop/postgres.c (the option sets should not conflict) and with the
 	 * common help() function in main/main.c.
 	 */
-	while ((opt = getopt(argc, argv, "B:bc:C:D:d:EeFf:h:ijk:lN:nOo:Pp:r:S:sTt:W:-:")) != -1)
+	while ((opt = getopt(argc, argv, "B:bc:C:D:d:EeFf:h:ijk:lN:nOPp:r:S:sTt:W:-:")) != -1)
 	{
 		switch (opt)
 		{
@@ -755,13 +763,6 @@ PostmasterMain(int argc, char *argv[])
 
 			case 'O':
 				SetConfigOption("allow_system_table_mods", "true", PGC_POSTMASTER, PGC_S_ARGV);
-				break;
-
-			case 'o':
-				/* Other options to pass to the backend on the command line */
-				snprintf(ExtraOptions + strlen(ExtraOptions),
-						 sizeof(ExtraOptions) - strlen(ExtraOptions),
-						 " %s", optarg);
 				break;
 
 			case 'P':
@@ -973,17 +974,6 @@ PostmasterMain(int argc, char *argv[])
 	LocalProcessControlFile(false);
 
 	/*
-	 * Initialize SSL library, if specified.
-	 */
-#ifdef USE_SSL
-	if (EnableSSL)
-	{
-		(void) secure_initialize(true);
-		LoadedSSL = true;
-	}
-#endif
-
-	/*
 	 * Register the apply launcher.  Since it registers a background worker,
 	 * it needs to be called before InitializeMaxBackends(), and it's probably
 	 * a good idea to call it before any modules had chance to take the
@@ -995,6 +985,17 @@ PostmasterMain(int argc, char *argv[])
 	 * process any libraries that should be preloaded at postmaster start
 	 */
 	process_shared_preload_libraries();
+
+	/*
+	 * Initialize SSL library, if specified.
+	 */
+#ifdef USE_SSL
+	if (EnableSSL)
+	{
+		(void) secure_initialize(true);
+		LoadedSSL = true;
+	}
+#endif
 
 	/*
 	 * Now that loadable modules have had their chance to register background
@@ -1059,10 +1060,9 @@ PostmasterMain(int argc, char *argv[])
 	 * only during a few moments during a standby promotion. However there is
 	 * a race condition: if pg_ctl promote is executed and creates the files
 	 * during a promotion, the files can stay around even after the server is
-	 * brought up to new master. Then, if new standby starts by using the
-	 * backup taken from that master, the files can exist at the server
-	 * startup and should be removed in order to avoid an unexpected
-	 * promotion.
+	 * brought up to be the primary.  Then, if a new standby starts by using
+	 * the backup taken from the new primary, the files can exist at server
+	 * startup and must be removed in order to avoid an unexpected promotion.
 	 *
 	 * Note that promotion signal files need to be removed before the startup
 	 * process is invoked. Because, after that, they can be used by
@@ -1207,8 +1207,9 @@ PostmasterMain(int argc, char *argv[])
 								 NULL,
 								 NULL);
 		if (err != kDNSServiceErr_NoError)
-			elog(LOG, "DNSServiceRegister() failed: error code %ld",
-				 (long) err);
+			ereport(LOG,
+					(errmsg("DNSServiceRegister() failed: error code %ld",
+							(long) err)));
 
 		/*
 		 * We don't bother to read the mDNS daemon's reply, and we expect that
@@ -1466,7 +1467,8 @@ getInstallationPaths(const char *argv0)
 
 	/* Locate the postgres executable itself */
 	if (find_my_exec(argv0, my_exec_path) < 0)
-		elog(FATAL, "%s: could not locate my own executable path", argv0);
+		ereport(FATAL,
+				(errmsg("%s: could not locate my own executable path", argv0)));
 
 #ifdef EXEC_BACKEND
 	/* Locate executable backend before we change working directory */
@@ -1835,6 +1837,8 @@ ServerLoop(void)
 			(now - AbortStartTime) >= SIGKILL_CHILDREN_AFTER_SECS)
 		{
 			/* We were gentle with them before. Not anymore */
+			ereport(LOG,
+					(errmsg("issuing SIGKILL to recalcitrant children")));
 			TerminateChildren(SIGKILL);
 			/* reset flag so we don't SIGKILL again */
 			AbortStartTime = 0;
@@ -1914,11 +1918,15 @@ initMasks(fd_set *rmask)
  * send anything to the client, which would typically be appropriate
  * if we detect a communications failure.)
  *
- * Set secure_done when negotiation of an encrypted layer (currently, TLS or
- * GSSAPI) is already completed.
+ * Set ssl_done and/or gss_done when negotiation of an encrypted layer
+ * (currently, TLS or GSSAPI) is completed. A successful negotiation of either
+ * encryption layer sets both flags, but a rejected negotiation sets only the
+ * flag for that layer, since the client may wish to try the other one. We
+ * should make no assumption here about the order in which the client may make
+ * requests.
  */
 static int
-ProcessStartupPacket(Port *port, bool secure_done)
+ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
 {
 	int32		len;
 	void	   *buf;
@@ -1951,7 +1959,7 @@ ProcessStartupPacket(Port *port, bool secure_done)
 	if (pq_getbytes(((char *) &len) + 1, 3) == EOF)
 	{
 		/* Got a partial length word, so bleat about that */
-		if (!secure_done)
+		if (!ssl_done && !gss_done)
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("incomplete startup packet")));
@@ -2003,7 +2011,7 @@ ProcessStartupPacket(Port *port, bool secure_done)
 		return STATUS_ERROR;
 	}
 
-	if (proto == NEGOTIATE_SSL_CODE && !secure_done)
+	if (proto == NEGOTIATE_SSL_CODE && !ssl_done)
 	{
 		char		SSLok;
 
@@ -2032,11 +2040,15 @@ retry1:
 		if (SSLok == 'S' && secure_open_server(port) == -1)
 			return STATUS_ERROR;
 #endif
-		/* regular startup packet, cancel, etc packet should follow... */
-		/* but not another SSL negotiation request */
-		return ProcessStartupPacket(port, true);
+
+		/*
+		 * regular startup packet, cancel, etc packet should follow, but not
+		 * another SSL negotiation request, and a GSS request should only
+		 * follow if SSL was rejected (client may negotiate in either order)
+		 */
+		return ProcessStartupPacket(port, true, SSLok == 'S');
 	}
-	else if (proto == NEGOTIATE_GSS_CODE && !secure_done)
+	else if (proto == NEGOTIATE_GSS_CODE && !gss_done)
 	{
 		char		GSSok = 'N';
 #ifdef ENABLE_GSS
@@ -2059,8 +2071,13 @@ retry1:
 		if (GSSok == 'G' && secure_open_gssapi(port) == -1)
 			return STATUS_ERROR;
 #endif
-		/* Won't ever see more than one negotiation request */
-		return ProcessStartupPacket(port, true);
+
+		/*
+		 * regular startup packet, cancel, etc packet should follow, but not
+		 * another GSS negotiation request, and an SSL request should only
+		 * follow if GSS was rejected (client may negotiate in either order)
+		 */
+		return ProcessStartupPacket(port, GSSok == 'G', true);
 	}
 
 	/* Could add additional special packet types here */
@@ -2259,6 +2276,11 @@ retry1:
 	if (strlen(port->user_name) >= NAMEDATALEN)
 		port->user_name[NAMEDATALEN - 1] = '\0';
 
+	if (am_walsender)
+		MyBackendType = B_WAL_SENDER;
+	else
+		MyBackendType = B_BACKEND;
+
 	/*
 	 * Normal walsender backends, e.g. for streaming replication, are not
 	 * connected to a particular database. But walsenders used for logical
@@ -2302,7 +2324,7 @@ retry1:
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("sorry, too many clients already")));
 			break;
-		case CAC_WAITBACKUP:
+		case CAC_SUPERUSER:
 			/* OK for now, will check in InitPostgres */
 			break;
 		case CAC_OK:
@@ -2422,29 +2444,34 @@ canAcceptConnections(int backend_type)
 	 * state.  We treat autovac workers the same as user backends for this
 	 * purpose.  However, bgworkers are excluded from this test; we expect
 	 * bgworker_should_start_now() decided whether the DB state allows them.
-	 *
-	 * In state PM_WAIT_BACKUP only superusers can connect (this must be
-	 * allowed so that a superuser can end online backup mode); we return
-	 * CAC_WAITBACKUP code to indicate that this must be checked later. Note
-	 * that neither CAC_OK nor CAC_WAITBACKUP can safely be returned until we
-	 * have checked for too many children.
 	 */
-	if (pmState != PM_RUN &&
+	if (pmState != PM_RUN && pmState != PM_HOT_STANDBY &&
 		backend_type != BACKEND_TYPE_BGWORKER)
 	{
-		if (pmState == PM_WAIT_BACKUP)
-			result = CAC_WAITBACKUP;	/* allow superusers only */
-		else if (Shutdown > NoShutdown)
+		if (Shutdown > NoShutdown)
 			return CAC_SHUTDOWN;	/* shutdown is pending */
 		else if (!FatalError &&
 				 (pmState == PM_STARTUP ||
 				  pmState == PM_RECOVERY))
 			return CAC_STARTUP; /* normal startup */
-		else if (!FatalError &&
-				 pmState == PM_HOT_STANDBY)
-			result = CAC_OK;	/* connection OK during hot standby */
 		else
 			return CAC_RECOVERY;	/* else must be crash recovery */
+	}
+
+	/*
+	 * "Smart shutdown" restrictions are applied only to normal connections,
+	 * not to autovac workers or bgworkers.  When only superusers can connect,
+	 * we return CAC_SUPERUSER to indicate that superuserness must be checked
+	 * later.  Note that neither CAC_OK nor CAC_SUPERUSER can safely be
+	 * returned until we have checked for too many children.
+	 */
+	if (connsAllowed != ALLOW_ALL_CONNS &&
+		backend_type == BACKEND_TYPE_NORMAL)
+	{
+		if (connsAllowed == ALLOW_SUPERUSER_CONNS)
+			result = CAC_SUPERUSER; /* allow superusers only */
+		else
+			return CAC_SHUTDOWN;	/* shutdown is pending */
 	}
 
 	/*
@@ -2554,9 +2581,14 @@ ClosePostmasterPorts(bool am_syslogger)
 				(errcode_for_file_access(),
 				 errmsg_internal("could not close postmaster death monitoring pipe in child process: %m")));
 	postmaster_alive_fds[POSTMASTER_FD_OWN] = -1;
+	/* Notify fd.c that we released one pipe FD. */
+	ReleaseExternalFD();
 #endif
 
-	/* Close the listen sockets */
+	/*
+	 * Close the postmaster's listen sockets.  These aren't tracked by fd.c,
+	 * so we don't call ReleaseExternalFD() here.
+	 */
 	for (i = 0; i < MAXLISTEN; i++)
 	{
 		if (ListenSocket[i] != PGINVALID_SOCKET)
@@ -2566,7 +2598,10 @@ ClosePostmasterPorts(bool am_syslogger)
 		}
 	}
 
-	/* If using syslogger, close the read side of the pipe */
+	/*
+	 * If using syslogger, close the read side of the pipe.  We don't bother
+	 * tracking this in fd.c, either.
+	 */
 	if (!am_syslogger)
 	{
 #ifndef WIN32
@@ -2764,34 +2799,22 @@ pmdie(SIGNAL_ARGS)
 			sd_notify(0, "STOPPING=1");
 #endif
 
-			if (pmState == PM_RUN || pmState == PM_RECOVERY ||
-				pmState == PM_HOT_STANDBY || pmState == PM_STARTUP)
+			/*
+			 * If we reached normal running, we have to wait for any online
+			 * backup mode to end; otherwise go straight to waiting for client
+			 * backends to exit.  (The difference is that in the former state,
+			 * we'll still let in new superuser clients, so that somebody can
+			 * end the online backup mode.)  If already in PM_STOP_BACKENDS or
+			 * a later state, do not change it.
+			 */
+			if (pmState == PM_RUN)
+				connsAllowed = ALLOW_SUPERUSER_CONNS;
+			else if (pmState == PM_HOT_STANDBY)
+				connsAllowed = ALLOW_NO_CONNS;
+			else if (pmState == PM_STARTUP || pmState == PM_RECOVERY)
 			{
-				/* autovac workers are told to shut down immediately */
-				/* and bgworkers too; does this need tweaking? */
-				SignalSomeChildren(SIGTERM,
-								   BACKEND_TYPE_AUTOVAC | BACKEND_TYPE_BGWORKER);
-				/* and the autovac launcher too */
-				if (AutoVacPID != 0)
-					signal_child(AutoVacPID, SIGTERM);
-				/* and the bgwriter too */
-				if (BgWriterPID != 0)
-					signal_child(BgWriterPID, SIGTERM);
-				/* and the walwriter too */
-				if (WalWriterPID != 0)
-					signal_child(WalWriterPID, SIGTERM);
-
-				/*
-				 * If we're in recovery, we can't kill the startup process
-				 * right away, because at present doing so does not release
-				 * its locks.  We might want to change this in a future
-				 * release.  For the time being, the PM_WAIT_READONLY state
-				 * indicates that we're waiting for the regular (read only)
-				 * backends to die off; once they do, we'll kill the startup
-				 * and walreceiver processes.
-				 */
-				pmState = (pmState == PM_RUN) ?
-					PM_WAIT_BACKUP : PM_WAIT_READONLY;
+				/* There should be no clients, so proceed to stop children */
+				pmState = PM_STOP_BACKENDS;
 			}
 
 			/*
@@ -2822,48 +2845,23 @@ pmdie(SIGNAL_ARGS)
 			sd_notify(0, "STOPPING=1");
 #endif
 
-			if (StartupPID != 0)
-				signal_child(StartupPID, SIGTERM);
-			if (BgWriterPID != 0)
-				signal_child(BgWriterPID, SIGTERM);
-			if (WalReceiverPID != 0)
-				signal_child(WalReceiverPID, SIGTERM);
 			if (pmState == PM_STARTUP || pmState == PM_RECOVERY)
 			{
-				SignalSomeChildren(SIGTERM, BACKEND_TYPE_BGWORKER);
-
-				/*
-				 * Only startup, bgwriter, walreceiver, possibly bgworkers,
-				 * and/or checkpointer should be active in this state; we just
-				 * signaled the first four, and we don't want to kill
-				 * checkpointer yet.
-				 */
-				pmState = PM_WAIT_BACKENDS;
+				/* Just shut down background processes silently */
+				pmState = PM_STOP_BACKENDS;
 			}
 			else if (pmState == PM_RUN ||
-					 pmState == PM_WAIT_BACKUP ||
-					 pmState == PM_WAIT_READONLY ||
-					 pmState == PM_WAIT_BACKENDS ||
 					 pmState == PM_HOT_STANDBY)
 			{
+				/* Report that we're about to zap live client sessions */
 				ereport(LOG,
 						(errmsg("aborting any active transactions")));
-				/* shut down all backends and workers */
-				SignalSomeChildren(SIGTERM,
-								   BACKEND_TYPE_NORMAL | BACKEND_TYPE_AUTOVAC |
-								   BACKEND_TYPE_BGWORKER);
-				/* and the autovac launcher too */
-				if (AutoVacPID != 0)
-					signal_child(AutoVacPID, SIGTERM);
-				/* and the walwriter too */
-				if (WalWriterPID != 0)
-					signal_child(WalWriterPID, SIGTERM);
-				pmState = PM_WAIT_BACKENDS;
+				pmState = PM_STOP_BACKENDS;
 			}
 
 			/*
-			 * Now wait for backends to exit.  If there are none,
-			 * PostmasterStateMachine will take the next step.
+			 * PostmasterStateMachine will issue any necessary signals, or
+			 * take the next step if no child processes need to be killed.
 			 */
 			PostmasterStateMachine();
 			break;
@@ -2958,7 +2956,7 @@ reaper(SIGNAL_ARGS)
 				ereport(LOG,
 						(errmsg("shutdown at recovery target")));
 				StartupStatus = STARTUP_NOT_RUNNING;
-				Shutdown = SmartShutdown;
+				Shutdown = Max(Shutdown, SmartShutdown);
 				TerminateChildren(SIGTERM);
 				pmState = PM_WAIT_BACKENDS;
 				/* PostmasterStateMachine logic does the rest */
@@ -3022,6 +3020,7 @@ reaper(SIGNAL_ARGS)
 			AbortStartTime = 0;
 			ReachedNormalRunning = true;
 			pmState = PM_RUN;
+			connsAllowed = ALLOW_ALL_CONNS;
 
 			/*
 			 * Crank up the background tasks, if we didn't do that already
@@ -3455,7 +3454,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	 * We only log messages and send signals if this is the first process
 	 * crash and we're not doing an immediate shutdown; otherwise, we're only
 	 * here to update postmaster's idea of live processes.  If we have already
-	 * signalled children, nonzero exit status is to be expected, so don't
+	 * signaled children, nonzero exit status is to be expected, so don't
 	 * clutter log.
 	 */
 	take_action = !FatalError && Shutdown != ImmediateShutdown;
@@ -3683,8 +3682,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	if (pmState == PM_RECOVERY ||
 		pmState == PM_HOT_STANDBY ||
 		pmState == PM_RUN ||
-		pmState == PM_WAIT_BACKUP ||
-		pmState == PM_WAIT_READONLY ||
+		pmState == PM_STOP_BACKENDS ||
 		pmState == PM_SHUTDOWN)
 		pmState = PM_WAIT_BACKENDS;
 
@@ -3767,33 +3765,58 @@ LogChildExit(int lev, const char *procname, int pid, int exitstatus)
 static void
 PostmasterStateMachine(void)
 {
-	if (pmState == PM_WAIT_BACKUP)
+	/* If we're doing a smart shutdown, try to advance that state. */
+	if (pmState == PM_RUN || pmState == PM_HOT_STANDBY)
 	{
-		/*
-		 * PM_WAIT_BACKUP state ends when online backup mode is not active.
-		 */
-		if (!BackupInProgress())
-			pmState = PM_WAIT_BACKENDS;
+		if (connsAllowed == ALLOW_SUPERUSER_CONNS)
+		{
+			/*
+			 * ALLOW_SUPERUSER_CONNS state ends as soon as online backup mode
+			 * is not active.
+			 */
+			if (!BackupInProgress())
+				connsAllowed = ALLOW_NO_CONNS;
+		}
+
+		if (connsAllowed == ALLOW_NO_CONNS)
+		{
+			/*
+			 * ALLOW_NO_CONNS state ends when we have no normal client
+			 * backends running.  Then we're ready to stop other children.
+			 */
+			if (CountChildren(BACKEND_TYPE_NORMAL) == 0)
+				pmState = PM_STOP_BACKENDS;
+		}
 	}
 
-	if (pmState == PM_WAIT_READONLY)
+	/*
+	 * If we're ready to do so, signal child processes to shut down.  (This
+	 * isn't a persistent state, but treating it as a distinct pmState allows
+	 * us to share this code across multiple shutdown code paths.)
+	 */
+	if (pmState == PM_STOP_BACKENDS)
 	{
-		/*
-		 * PM_WAIT_READONLY state ends when we have no regular backends that
-		 * have been started during recovery.  We kill the startup and
-		 * walreceiver processes and transition to PM_WAIT_BACKENDS.  Ideally,
-		 * we might like to kill these processes first and then wait for
-		 * backends to die off, but that doesn't work at present because
-		 * killing the startup process doesn't release its locks.
-		 */
-		if (CountChildren(BACKEND_TYPE_NORMAL) == 0)
-		{
-			if (StartupPID != 0)
-				signal_child(StartupPID, SIGTERM);
-			if (WalReceiverPID != 0)
-				signal_child(WalReceiverPID, SIGTERM);
-			pmState = PM_WAIT_BACKENDS;
-		}
+		/* Signal all backend children except walsenders */
+		SignalSomeChildren(SIGTERM,
+						   BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND);
+		/* and the autovac launcher too */
+		if (AutoVacPID != 0)
+			signal_child(AutoVacPID, SIGTERM);
+		/* and the bgwriter too */
+		if (BgWriterPID != 0)
+			signal_child(BgWriterPID, SIGTERM);
+		/* and the walwriter too */
+		if (WalWriterPID != 0)
+			signal_child(WalWriterPID, SIGTERM);
+		/* If we're in recovery, also stop startup and walreceiver procs */
+		if (StartupPID != 0)
+			signal_child(StartupPID, SIGTERM);
+		if (WalReceiverPID != 0)
+			signal_child(WalReceiverPID, SIGTERM);
+		/* checkpointer, archiver, stats, and syslogger may continue for now */
+
+		/* Now transition to PM_WAIT_BACKENDS state to wait for them to die */
+		pmState = PM_WAIT_BACKENDS;
 	}
 
 	/*
@@ -3814,7 +3837,7 @@ PostmasterStateMachine(void)
 		 * later after writing the checkpoint record, like the archiver
 		 * process.
 		 */
-		if (CountChildren(BACKEND_TYPE_NORMAL | BACKEND_TYPE_WORKER) == 0 &&
+		if (CountChildren(BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND) == 0 &&
 			StartupPID == 0 &&
 			WalReceiverPID == 0 &&
 			BgWriterPID == 0 &&
@@ -4155,7 +4178,7 @@ BackendStartup(Port *port)
 	/* Pass down canAcceptConnections state */
 	port->canAcceptConnections = canAcceptConnections(BACKEND_TYPE_NORMAL);
 	bn->dead_end = (port->canAcceptConnections != CAC_OK &&
-					port->canAcceptConnections != CAC_WAITBACKUP);
+					port->canAcceptConnections != CAC_SUPERUSER);
 
 	/*
 	 * Unless it's a dead_end child, assign it a child slot number
@@ -4264,6 +4287,8 @@ report_fork_failure_to_client(Port *port, int errnum)
  * returns: nothing.  Will not return at all if there's any failure.
  *
  * Note: this code does not depend on having any access to shared memory.
+ * Indeed, our approach to SIGTERM/timeout handling *requires* that
+ * shared memory not have been touched yet; see comments within.
  * In the EXEC_BACKEND case, we are physically attached to shared memory
  * but have not yet set up most of our local pointers to shmem structures.
  */
@@ -4274,10 +4299,13 @@ BackendInitialize(Port *port)
 	int			ret;
 	char		remote_host[NI_MAXHOST];
 	char		remote_port[NI_MAXSERV];
-	char		remote_ps_data[NI_MAXHOST];
+	StringInfoData ps_data;
 
 	/* Save port etc. for ps status */
 	MyProcPort = port;
+
+	/* Tell fd.c about the long-lived FD associated with the port */
+	ReserveExternalFD();
 
 	/*
 	 * PreAuthDelay is a debugging aid for investigating problems in the
@@ -4304,22 +4332,17 @@ BackendInitialize(Port *port)
 	whereToSendOutput = DestRemote; /* now safe to ereport to client */
 
 	/*
-	 * We arrange for a simple exit(1) if we receive SIGTERM or SIGQUIT or
-	 * timeout while trying to collect the startup packet.  Otherwise the
-	 * postmaster cannot shutdown the database FAST or IMMED cleanly if a
-	 * buggy client fails to send the packet promptly.  XXX it follows that
-	 * the remainder of this function must tolerate losing control at any
-	 * instant.  Likewise, any pg_on_exit_callback registered before or during
-	 * this function must be prepared to execute at any instant between here
-	 * and the end of this function.  Furthermore, affected callbacks execute
-	 * partially or not at all when a second exit-inducing signal arrives
-	 * after proc_exit_prepare() decrements on_proc_exit_index.  (Thanks to
-	 * that mechanic, callbacks need not anticipate more than one call.)  This
-	 * is fragile; it ought to instead follow the norm of handling interrupts
-	 * at selected, safe opportunities.
+	 * We arrange to do _exit(1) if we receive SIGTERM or timeout while trying
+	 * to collect the startup packet; while SIGQUIT results in _exit(2).
+	 * Otherwise the postmaster cannot shutdown the database FAST or IMMED
+	 * cleanly if a buggy client fails to send the packet promptly.
+	 *
+	 * Exiting with _exit(1) is only possible because we have not yet touched
+	 * shared memory; therefore no outside-the-process state needs to get
+	 * cleaned up.
 	 */
-	pqsignal(SIGTERM, startup_die);
-	pqsignal(SIGQUIT, startup_die);
+	pqsignal(SIGTERM, process_startup_packet_die);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 	PG_SETMASK(&StartupBlockSig);
 
@@ -4335,10 +4358,6 @@ BackendInitialize(Port *port)
 		ereport(WARNING,
 				(errmsg_internal("pg_getnameinfo_all() failed: %s",
 								 gai_strerror(ret))));
-	if (remote_port[0] == '\0')
-		snprintf(remote_ps_data, sizeof(remote_ps_data), "%s", remote_host);
-	else
-		snprintf(remote_ps_data, sizeof(remote_ps_data), "%s(%s)", remote_host, remote_port);
 
 	/*
 	 * Save remote_host and remote_port in port structure (after this, they
@@ -4379,8 +4398,8 @@ BackendInitialize(Port *port)
 		port->remote_hostname = strdup(remote_host);
 
 	/*
-	 * Ready to begin client interaction.  We will give up and exit(1) after a
-	 * time delay, so that a broken client can't hog a connection
+	 * Ready to begin client interaction.  We will give up and _exit(1) after
+	 * a time delay, so that a broken client can't hog a connection
 	 * indefinitely.  PreAuthDelay and any DNS interactions above don't count
 	 * against the time limit.
 	 *
@@ -4400,7 +4419,24 @@ BackendInitialize(Port *port)
 	 * Receive the startup packet (which might turn out to be a cancel request
 	 * packet).
 	 */
-	status = ProcessStartupPacket(port, false);
+	status = ProcessStartupPacket(port, false, false);
+
+	/*
+	 * Disable the timeout, and prevent SIGTERM again.
+	 */
+	disable_timeout(STARTUP_PACKET_TIMEOUT, false);
+	PG_SETMASK(&BlockSig);
+
+	/*
+	 * As a safety check that nothing in startup has yet performed
+	 * shared-memory modifications that would need to be undone if we had
+	 * exited through SIGTERM or timeout above, check that no on_shmem_exit
+	 * handlers have been registered yet.  (This isn't terribly bulletproof,
+	 * since someone might misuse an on_proc_exit handler for shmem cleanup,
+	 * but it's a cheap and helpful check.  We cannot disallow on_proc_exit
+	 * handlers unfortunately, since pq_init() already registered one.)
+	 */
+	check_on_shmem_exit_lists_are_empty();
 
 	/*
 	 * Stop here if it was bad or a cancel packet.  ProcessStartupPacket
@@ -4412,27 +4448,21 @@ BackendInitialize(Port *port)
 	/*
 	 * Now that we have the user and database name, we can set the process
 	 * title for ps.  It's good to do this as early as possible in startup.
-	 *
-	 * For a walsender, the ps display is set in the following form:
-	 *
-	 * postgres: walsender <user> <host> <activity>
-	 *
-	 * To achieve that, we pass "walsender" as username and username as dbname
-	 * to init_ps_display(). XXX: should add a new variant of
-	 * init_ps_display() to avoid abusing the parameters like this.
 	 */
+	initStringInfo(&ps_data);
 	if (am_walsender)
-		init_ps_display(pgstat_get_backend_desc(B_WAL_SENDER), port->user_name, remote_ps_data,
-						update_process_title ? "authentication" : "");
-	else
-		init_ps_display(port->user_name, port->database_name, remote_ps_data,
-						update_process_title ? "authentication" : "");
+		appendStringInfo(&ps_data, "%s ", GetBackendTypeDesc(B_WAL_SENDER));
+	appendStringInfo(&ps_data, "%s ", port->user_name);
+	if (!am_walsender)
+		appendStringInfo(&ps_data, "%s ", port->database_name);
+	appendStringInfo(&ps_data, "%s", port->remote_host);
+	if (port->remote_port[0] != '\0')
+		appendStringInfo(&ps_data, "(%s)", port->remote_port);
 
-	/*
-	 * Disable the timeout, and prevent SIGTERM/SIGQUIT again.
-	 */
-	disable_timeout(STARTUP_PACKET_TIMEOUT, false);
-	PG_SETMASK(&BlockSig);
+	init_ps_display(ps_data.data);
+	pfree(ps_data.data);
+
+	set_ps_display("initializing");
 }
 
 
@@ -4440,54 +4470,16 @@ BackendInitialize(Port *port)
  * BackendRun -- set up the backend's argument list and invoke PostgresMain()
  *
  * returns:
- *		Shouldn't return at all.
- *		If PostgresMain() fails, return status.
+ *		Doesn't return at all.
  */
 static void
 BackendRun(Port *port)
 {
-	char	  **av;
-	int			maxac;
-	int			ac;
-	int			i;
+	char	   *av[2];
+	const int	ac = 1;
 
-	/*
-	 * Now, build the argv vector that will be given to PostgresMain.
-	 *
-	 * The maximum possible number of commandline arguments that could come
-	 * from ExtraOptions is (strlen(ExtraOptions) + 1) / 2; see
-	 * pg_split_opts().
-	 */
-	maxac = 2;					/* for fixed args supplied below */
-	maxac += (strlen(ExtraOptions) + 1) / 2;
-
-	av = (char **) MemoryContextAlloc(TopMemoryContext,
-									  maxac * sizeof(char *));
-	ac = 0;
-
-	av[ac++] = "postgres";
-
-	/*
-	 * Pass any backend switches specified with -o on the postmaster's own
-	 * command line.  We assume these are secure.
-	 */
-	pg_split_opts(av, &ac, ExtraOptions);
-
-	av[ac] = NULL;
-
-	Assert(ac < maxac);
-
-	/*
-	 * Debug: print arguments being passed to backend
-	 */
-	ereport(DEBUG3,
-			(errmsg_internal("%s child[%d]: starting with (",
-							 progname, (int) getpid())));
-	for (i = 0; i < ac; ++i)
-		ereport(DEBUG3,
-				(errmsg_internal("\t%s", av[i])));
-	ereport(DEBUG3,
-			(errmsg_internal(")")));
+	av[0] = "postgres";
+	av[1] = NULL;
 
 	/*
 	 * Make sure we aren't in PostmasterContext anymore.  (We can't delete it
@@ -4684,16 +4676,18 @@ retry:
 									NULL);
 	if (paramHandle == INVALID_HANDLE_VALUE)
 	{
-		elog(LOG, "could not create backend parameter file mapping: error code %lu",
-			 GetLastError());
+		ereport(LOG,
+				(errmsg("could not create backend parameter file mapping: error code %lu",
+						GetLastError())));
 		return -1;
 	}
 
 	param = MapViewOfFile(paramHandle, FILE_MAP_WRITE, 0, 0, sizeof(BackendParameters));
 	if (!param)
 	{
-		elog(LOG, "could not map backend parameter memory: error code %lu",
-			 GetLastError());
+		ereport(LOG,
+				(errmsg("could not map backend parameter memory: error code %lu",
+						GetLastError())));
 		CloseHandle(paramHandle);
 		return -1;
 	}
@@ -4718,7 +4712,10 @@ retry:
 	}
 	if (cmdLine[sizeof(cmdLine) - 2] != '\0')
 	{
-		elog(LOG, "subprocess command line too long");
+		ereport(LOG,
+				(errmsg("subprocess command line too long")));
+		UnmapViewOfFile(param);
+		CloseHandle(paramHandle);
 		return -1;
 	}
 
@@ -4733,8 +4730,11 @@ retry:
 	if (!CreateProcess(NULL, cmdLine, NULL, NULL, TRUE, CREATE_SUSPENDED,
 					   NULL, NULL, &si, &pi))
 	{
-		elog(LOG, "CreateProcess call failed: %m (error code %lu)",
-			 GetLastError());
+		ereport(LOG,
+				(errmsg("CreateProcess() call failed: %m (error code %lu)",
+						GetLastError())));
+		UnmapViewOfFile(param);
+		CloseHandle(paramHandle);
 		return -1;
 	}
 
@@ -4750,16 +4750,20 @@ retry:
 									 GetLastError())));
 		CloseHandle(pi.hProcess);
 		CloseHandle(pi.hThread);
+		UnmapViewOfFile(param);
+		CloseHandle(paramHandle);
 		return -1;				/* log made by save_backend_variables */
 	}
 
 	/* Drop the parameter shared memory that is now inherited to the backend */
 	if (!UnmapViewOfFile(param))
-		elog(LOG, "could not unmap view of backend parameter file: error code %lu",
-			 GetLastError());
+		ereport(LOG,
+				(errmsg("could not unmap view of backend parameter file: error code %lu",
+						GetLastError())));
 	if (!CloseHandle(paramHandle))
-		elog(LOG, "could not close handle to backend parameter file: error code %lu",
-			 GetLastError());
+		ereport(LOG,
+				(errmsg("could not close handle to backend parameter file: error code %lu",
+						GetLastError())));
 
 	/*
 	 * Reserve the memory region used by our main shared memory segment before
@@ -4865,9 +4869,6 @@ SubPostmasterMain(int argc, char *argv[])
 	IsPostmasterEnvironment = true;
 	whereToSendOutput = DestNone;
 
-	/* Setup as postmaster child */
-	InitPostmasterChild();
-
 	/* Setup essential subsystems (to ensure elog() behaves sanely) */
 	InitializeGUCOptions();
 
@@ -4883,9 +4884,16 @@ SubPostmasterMain(int argc, char *argv[])
 	ClosePostmasterPorts(strcmp(argv[1], "--forklog") == 0);
 
 	/*
-	 * Set reference point for stack-depth checking
+	 * Start our win32 signal implementation. This has to be done after we
+	 * read the backend variables, because we need to pick up the signal pipe
+	 * from the parent process.
 	 */
-	set_stack_base();
+#ifdef WIN32
+	pgwin32_signal_initialize();
+#endif
+
+	/* Setup as postmaster child */
+	InitPostmasterChild();
 
 	/*
 	 * Set up memory area for GSS information. Mirrors the code in ConnCreate
@@ -4929,19 +4937,6 @@ SubPostmasterMain(int argc, char *argv[])
 		AutovacuumLauncherIAm();
 	if (strcmp(argv[1], "--forkavworker") == 0)
 		AutovacuumWorkerIAm();
-
-	/*
-	 * Start our win32 signal implementation. This has to be done after we
-	 * read the backend variables, because we need to pick up the signal pipe
-	 * from the parent process.
-	 */
-#ifdef WIN32
-	pgwin32_signal_initialize();
-#endif
-
-	/* In EXEC_BACKEND case we will not have inherited these settings */
-	pqinitmask();
-	PG_SETMASK(&BlockSig);
 
 	/* Read in remaining GUC variables */
 	read_nondefault_variables();
@@ -5124,7 +5119,7 @@ ExitPostmaster(int status)
 		ereport(LOG,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg_internal("postmaster became multithreaded"),
-				 errdetail("Please report this to <pgsql-bugs@lists.postgresql.org>.")));
+				 errdetail("Please report this to <%s>.", PACKAGE_BUGREPORT)));
 #endif
 
 	/* should cleanup shared memory and kill all backends */
@@ -5226,6 +5221,8 @@ sigusr1_handler(SIGNAL_ARGS)
 #endif
 
 		pmState = PM_HOT_STANDBY;
+		connsAllowed = ALLOW_ALL_CONNS;
+
 		/* Some workers may be scheduled to start now */
 		StartWorkerNeeded = true;
 	}
@@ -5258,7 +5255,7 @@ sigusr1_handler(SIGNAL_ARGS)
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_START_AUTOVAC_LAUNCHER) &&
-		Shutdown == NoShutdown)
+		Shutdown <= SmartShutdown && pmState < PM_STOP_BACKENDS)
 	{
 		/*
 		 * Start one iteration of the autovacuum daemon, even if autovacuuming
@@ -5273,7 +5270,7 @@ sigusr1_handler(SIGNAL_ARGS)
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_START_AUTOVAC_WORKER) &&
-		Shutdown == NoShutdown)
+		Shutdown <= SmartShutdown && pmState < PM_STOP_BACKENDS)
 	{
 		/* The autovacuum launcher wants us to start a worker process. */
 		StartAutovacuumWorker();
@@ -5304,10 +5301,15 @@ sigusr1_handler(SIGNAL_ARGS)
 
 	if (StartupPID != 0 &&
 		(pmState == PM_STARTUP || pmState == PM_RECOVERY ||
-		 pmState == PM_HOT_STANDBY || pmState == PM_WAIT_READONLY) &&
+		 pmState == PM_HOT_STANDBY) &&
 		CheckPromoteSignal())
 	{
-		/* Tell startup process to finish recovery */
+		/*
+		 * Tell startup process to finish recovery.
+		 *
+		 * Leave the promote signal file in place and let the Startup process
+		 * do the unlink.
+		 */
 		signal_child(StartupPID, SIGUSR2);
 	}
 
@@ -5319,18 +5321,22 @@ sigusr1_handler(SIGNAL_ARGS)
 }
 
 /*
- * SIGTERM or SIGQUIT while processing startup packet.
- * Clean up and exit(1).
+ * SIGTERM while processing startup packet.
  *
- * XXX: possible future improvement: try to send a message indicating
- * why we are disconnecting.  Problem is to be sure we don't block while
- * doing so, nor mess up SSL initialization.  In practice, if the client
- * has wedged here, it probably couldn't do anything with the message anyway.
+ * Running proc_exit() from a signal handler would be quite unsafe.
+ * However, since we have not yet touched shared memory, we can just
+ * pull the plug and exit without running any atexit handlers.
+ *
+ * One might be tempted to try to send a message, or log one, indicating
+ * why we are disconnecting.  However, that would be quite unsafe in itself.
+ * Also, it seems undesirable to provide clues about the database's state
+ * to a client that has not yet completed authentication, or even sent us
+ * a startup packet.
  */
 static void
-startup_die(SIGNAL_ARGS)
+process_startup_packet_die(SIGNAL_ARGS)
 {
-	proc_exit(1);
+	_exit(1);
 }
 
 /*
@@ -5349,12 +5355,12 @@ dummy_handler(SIGNAL_ARGS)
 
 /*
  * Timeout while processing startup packet.
- * As for startup_die(), we clean up and exit(1).
+ * As for process_startup_packet_die(), we exit via _exit(1).
  */
 static void
 StartupPacketTimeoutHandler(void)
 {
-	proc_exit(1);
+	_exit(1);
 }
 
 
@@ -5589,7 +5595,7 @@ StartAutovacuumWorker(void)
 	 * might not even be connected to shared memory, so don't try to call
 	 * AutoVacWorkerFailed.)  Note that we also need to signal it so that it
 	 * responds to the condition, but we don't do that here, instead waiting
-	 * for ServerLoop to do it.  This way we avoid a ping-pong signalling in
+	 * for ServerLoop to do it.  This way we avoid a ping-pong signaling in
 	 * quick succession between the autovac launcher and postmaster in case
 	 * things get ugly.
 	 */
@@ -5617,8 +5623,8 @@ MaybeStartWalReceiver(void)
 {
 	if (WalReceiverPID == 0 &&
 		(pmState == PM_STARTUP || pmState == PM_RECOVERY ||
-		 pmState == PM_HOT_STANDBY || pmState == PM_WAIT_READONLY) &&
-		Shutdown == NoShutdown)
+		 pmState == PM_HOT_STANDBY) &&
+		Shutdown <= SmartShutdown)
 	{
 		WalReceiverPID = StartWalReceiver();
 		if (WalReceiverPID != 0)
@@ -5641,7 +5647,9 @@ CreateOptsFile(int argc, char *argv[], char *fullprogname)
 
 	if ((fp = fopen(OPTS_FILE, "w")) == NULL)
 	{
-		elog(LOG, "could not create file \"%s\": %m", OPTS_FILE);
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", OPTS_FILE)));
 		return false;
 	}
 
@@ -5652,7 +5660,9 @@ CreateOptsFile(int argc, char *argv[], char *fullprogname)
 
 	if (fclose(fp))
 	{
-		elog(LOG, "could not write file \"%s\": %m", OPTS_FILE);
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", OPTS_FILE)));
 		return false;
 	}
 
@@ -5871,8 +5881,7 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 		case PM_SHUTDOWN_2:
 		case PM_SHUTDOWN:
 		case PM_WAIT_BACKENDS:
-		case PM_WAIT_READONLY:
-		case PM_WAIT_BACKUP:
+		case PM_STOP_BACKENDS:
 			break;
 
 		case PM_RUN:
@@ -6203,8 +6212,6 @@ save_backend_variables(BackendParameters *param, Port *port,
 
 	strlcpy(param->pkglib_path, pkglib_path, MAXPGPATH);
 
-	strlcpy(param->ExtraOptions, ExtraOptions, MAXPGPATH);
-
 	return true;
 }
 
@@ -6435,7 +6442,19 @@ restore_backend_variables(BackendParameters *param, Port *port)
 
 	strlcpy(pkglib_path, param->pkglib_path, MAXPGPATH);
 
-	strlcpy(ExtraOptions, param->ExtraOptions, MAXPGPATH);
+	/*
+	 * We need to restore fd.c's counts of externally-opened FDs; to avoid
+	 * confusion, be sure to do this after restoring max_safe_fds.  (Note:
+	 * BackendInitialize will handle this for port->sock.)
+	 */
+#ifndef WIN32
+	if (postmaster_alive_fds[0] >= 0)
+		ReserveExternalFD();
+	if (postmaster_alive_fds[1] >= 0)
+		ReserveExternalFD();
+#endif
+	if (pgStatSock != PGINVALID_SOCKET)
+		ReserveExternalFD();
 }
 
 
@@ -6577,6 +6596,10 @@ InitPostmasterDeathWatchHandle(void)
 		ereport(FATAL,
 				(errcode_for_file_access(),
 				 errmsg_internal("could not create pipe to monitor postmaster death: %m")));
+
+	/* Notify fd.c that we've eaten two FDs for the pipe. */
+	ReserveExternalFD();
+	ReserveExternalFD();
 
 	/*
 	 * Set O_NONBLOCK to allow testing for the fd's presence with a read()

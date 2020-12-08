@@ -3,7 +3,7 @@
  * auth.c
  *	  Routines to handle network authentication
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -77,9 +77,7 @@ static int	ident_inet(hbaPort *port);
  * Peer authentication
  *----------------------------------------------------------------
  */
-#ifdef HAVE_UNIX_SOCKETS
 static int	auth_peer(hbaPort *port);
-#endif
 
 
 /*----------------------------------------------------------------
@@ -190,8 +188,7 @@ static int	pg_GSS_recvauth(Port *port);
  */
 #ifdef ENABLE_SSPI
 typedef SECURITY_STATUS
-			(WINAPI * QUERY_SECURITY_CONTEXT_TOKEN_FN) (
-														PCtxtHandle, void **);
+			(WINAPI * QUERY_SECURITY_CONTEXT_TOKEN_FN) (PCtxtHandle, void **);
 static int	pg_SSPI_recvauth(Port *port);
 static int	pg_SSPI_make_upn(char *accountname,
 							 size_t accountnamesize,
@@ -559,11 +556,7 @@ ClientAuthentication(Port *port)
 			break;
 
 		case uaPeer:
-#ifdef HAVE_UNIX_SOCKETS
 			status = auth_peer(port);
-#else
-			Assert(false);
-#endif
 			break;
 
 		case uaIdent:
@@ -705,7 +698,7 @@ recv_password_packet(Port *port)
 	}
 
 	initStringInfo(&buf);
-	if (pq_getmessage(&buf, 1000))	/* receive password */
+	if (pq_getmessage(&buf, 0)) /* receive password */
 	{
 		/* EOF - pq_getmessage already logged a suitable message */
 		pfree(buf.data);
@@ -1153,8 +1146,7 @@ pg_GSS_recvauth(Port *port)
 		elog(DEBUG4, "processing received GSS token of length %u",
 			 (unsigned int) gbuf.length);
 
-		maj_stat = gss_accept_sec_context(
-										  &min_stat,
+		maj_stat = gss_accept_sec_context(&min_stat,
 										  &port->gss->ctx,
 										  port->gss->cred,
 										  &gbuf,
@@ -1393,6 +1385,13 @@ pg_SSPI_recvauth(Port *port)
 		mtype = pq_getbyte();
 		if (mtype != 'p')
 		{
+			if (sspictx != NULL)
+			{
+				DeleteSecurityContext(sspictx);
+				free(sspictx);
+			}
+			FreeCredentialsHandle(&sspicred);
+
 			/* Only log error if client didn't disconnect. */
 			if (mtype != EOF)
 				ereport(ERROR,
@@ -1408,6 +1407,12 @@ pg_SSPI_recvauth(Port *port)
 		{
 			/* EOF - pq_getmessage already logged error */
 			pfree(buf.data);
+			if (sspictx != NULL)
+			{
+				DeleteSecurityContext(sspictx);
+				free(sspictx);
+			}
+			FreeCredentialsHandle(&sspicred);
 			return STATUS_ERROR;
 		}
 
@@ -1513,10 +1518,10 @@ pg_SSPI_recvauth(Port *port)
 	secur32 = LoadLibrary("SECUR32.DLL");
 	if (secur32 == NULL)
 		ereport(ERROR,
-				(errmsg_internal("could not load secur32.dll: error code %lu",
-								 GetLastError())));
+				(errmsg("could not load library \"%s\": error code %lu",
+						"SECUR32.DLL", GetLastError())));
 
-	_QuerySecurityContextToken = (QUERY_SECURITY_CONTEXT_TOKEN_FN)
+	_QuerySecurityContextToken = (QUERY_SECURITY_CONTEXT_TOKEN_FN) (pg_funcptr_t)
 		GetProcAddress(secur32, "QuerySecurityContextToken");
 	if (_QuerySecurityContextToken == NULL)
 	{
@@ -1984,16 +1989,16 @@ ident_inet_done:
  *
  *	Iff authorized, return STATUS_OK, otherwise return STATUS_ERROR.
  */
-#ifdef HAVE_UNIX_SOCKETS
-
 static int
 auth_peer(hbaPort *port)
 {
 	uid_t		uid;
 	gid_t		gid;
+#ifndef WIN32
 	struct passwd *pw;
 	char	   *peer_user;
 	int			ret;
+#endif
 
 	if (getpeereid(port->sock, &uid, &gid) != 0)
 	{
@@ -2009,6 +2014,7 @@ auth_peer(hbaPort *port)
 		return STATUS_ERROR;
 	}
 
+#ifndef WIN32
 	errno = 0;					/* clear errno before call */
 	pw = getpwuid(uid);
 	if (!pw)
@@ -2030,8 +2036,12 @@ auth_peer(hbaPort *port)
 	pfree(peer_user);
 
 	return ret;
+#else
+	/* should have failed with ENOSYS above */
+	Assert(false);
+	return STATUS_ERROR;
+#endif
 }
-#endif							/* HAVE_UNIX_SOCKETS */
 
 
 /*----------------------------------------------------------------
@@ -2121,9 +2131,10 @@ pam_passwd_conv_proc(int num_msg, const struct pam_message **msg,
 				reply[i].resp_retcode = PAM_SUCCESS;
 				break;
 			default:
-				elog(LOG, "unsupported PAM conversation %d/\"%s\"",
-					 msg[i]->msg_style,
-					 msg[i]->msg ? msg[i]->msg : "(none)");
+				ereport(LOG,
+						(errmsg("unsupported PAM conversation %d/\"%s\"",
+								msg[i]->msg_style,
+								msg[i]->msg ? msg[i]->msg : "(none)")));
 				goto fail;
 		}
 	}
@@ -2493,9 +2504,9 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
 		if (_ldap_start_tls_sA == NULL)
 		{
 			/*
-			 * Need to load this function dynamically because it does not
-			 * exist on Windows 2000, and causes a load error for the whole
-			 * exe if referenced.
+			 * Need to load this function dynamically because it may not exist
+			 * on Windows, and causes a load error for the whole exe if
+			 * referenced.
 			 */
 			HANDLE		ldaphandle;
 
@@ -2507,17 +2518,19 @@ InitializeLDAPConnection(Port *port, LDAP **ldap)
 				 * wldap32, but check anyway
 				 */
 				ereport(LOG,
-						(errmsg("could not load wldap32.dll")));
+						(errmsg("could not load library \"%s\": error code %lu",
+								"WLDAP32.DLL", GetLastError())));
 				ldap_unbind(*ldap);
 				return STATUS_ERROR;
 			}
-			_ldap_start_tls_sA = (__ldap_start_tls_sA) GetProcAddress(ldaphandle, "ldap_start_tls_sA");
+			_ldap_start_tls_sA = (__ldap_start_tls_sA) (pg_funcptr_t) GetProcAddress(ldaphandle, "ldap_start_tls_sA");
 			if (_ldap_start_tls_sA == NULL)
 			{
 				ereport(LOG,
 						(errmsg("could not load function _ldap_start_tls_sA in wldap32.dll"),
 						 errdetail("LDAP over SSL is not supported on this platform.")));
 				ldap_unbind(*ldap);
+				FreeLibrary(ldaphandle);
 				return STATUS_ERROR;
 			}
 

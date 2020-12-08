@@ -4,7 +4,7 @@
  * src/backend/utils/adt/formatting.c
  *
  *
- *	 Portions Copyright (c) 1999-2019, PostgreSQL Global Development Group
+ *	 Portions Copyright (c) 1999-2020, PostgreSQL Global Development Group
  *
  *
  *	 TO_CHAR(); TO_TIMESTAMP(); TO_DATE(); TO_NUMBER();
@@ -72,11 +72,9 @@
 
 /*
  * towlower() and friends should be in <wctype.h>, but some pre-C99 systems
- * declare them in <wchar.h>.
+ * declare them in <wchar.h>, so include that too.
  */
-#ifdef HAVE_WCHAR_H
 #include <wchar.h>
-#endif
 #ifdef HAVE_WCTYPE_H
 #include <wctype.h>
 #endif
@@ -88,6 +86,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
+#include "parser/scansup.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
@@ -317,16 +316,6 @@ static const char *const numth[] = {"st", "nd", "rd", "th", NULL};
  * Flags & Options:
  * ----------
  */
-#define ONE_UPPER		1		/* Name */
-#define ALL_UPPER		2		/* NAME */
-#define ALL_LOWER		3		/* name */
-
-#define MAX_MONTH_LEN	9
-#define MAX_MON_LEN		3
-#define MAX_DAY_LEN		9
-#define MAX_DY_LEN		3
-#define MAX_RM_LEN		4
-
 #define TH_UPPER		1
 #define TH_LOWER		2
 
@@ -490,7 +479,7 @@ typedef struct
 			(_X)->mode, (_X)->hh, (_X)->pm, (_X)->mi, (_X)->ss, (_X)->ssss, \
 			(_X)->d, (_X)->dd, (_X)->ddd, (_X)->mm, (_X)->ms, (_X)->year, \
 			(_X)->bc, (_X)->ww, (_X)->w, (_X)->cc, (_X)->j, (_X)->us, \
-			(_X)->yysz, (_X)->clock);
+			(_X)->yysz, (_X)->clock)
 #define DEBUG_TM(_X) \
 		elog(DEBUG_elog_output, "TM:\nsec %d\nyear %d\nmin %d\nwday %d\nhour %d\nyday %d\nmday %d\nnisdst %d\nmon %d\n",\
 			(_X)->tm_sec, (_X)->tm_year,\
@@ -1048,8 +1037,8 @@ static void parse_format(FormatNode *node, const char *str, const KeyWord *kw,
 
 static void DCH_to_char(FormatNode *node, bool is_interval,
 						TmToChar *in, char *out, Oid collid);
-static void DCH_from_char(FormatNode *node, char *in, TmFromChar *out,
-						  bool std, bool *have_error);
+static void DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
+						  Oid collid, bool std, bool *have_error);
 
 #ifdef DEBUG_TO_FROM_CHAR
 static void dump_index(const KeyWord *k, const int *index);
@@ -1059,20 +1048,23 @@ static void dump_node(FormatNode *node, int max);
 static const char *get_th(char *num, int type);
 static char *str_numth(char *dest, char *num, int type);
 static int	adjust_partial_year_to_2020(int year);
-static int	strspace_len(char *str);
+static int	strspace_len(const char *str);
 static void from_char_set_mode(TmFromChar *tmfc, const FromCharDateMode mode,
 							   bool *have_error);
 static void from_char_set_int(int *dest, const int value, const FormatNode *node,
 							  bool *have_error);
-static int	from_char_parse_int_len(int *dest, char **src, const int len,
+static int	from_char_parse_int_len(int *dest, const char **src, const int len,
 									FormatNode *node, bool *have_error);
-static int	from_char_parse_int(int *dest, char **src, FormatNode *node,
+static int	from_char_parse_int(int *dest, const char **src, FormatNode *node,
 								bool *have_error);
-static int	seq_search(char *name, const char *const *array, int type, int max, int *len);
-static int	from_char_seq_search(int *dest, char **src,
-								 const char *const *array, int type, int max,
+static int	seq_search_ascii(const char *name, const char *const *array, int *len);
+static int	seq_search_localized(const char *name, char **array, int *len,
+								 Oid collid);
+static int	from_char_seq_search(int *dest, const char **src,
+								 const char *const *array,
+								 char **localized_array, Oid collid,
 								 FormatNode *node, bool *have_error);
-static void do_to_timestamp(text *date_txt, text *fmt, bool std,
+static void do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 							struct pg_tm *tm, fsec_t *fsec, int *fprec,
 							uint32 *flags, bool *have_error);
 static char *fill_str(char *str, int c, int max);
@@ -1389,10 +1381,12 @@ parse_format(FormatNode *node, const char *str, const KeyWord *kw,
 		{
 			int			chlen;
 
-			if (flags & STD_FLAG)
+			if ((flags & STD_FLAG) && *str != '"')
 			{
 				/*
-				 * Standard mode, allow only following separators: "-./,':; "
+				 * Standard mode, allow only following separators: "-./,':; ".
+				 * However, we support double quotes even in standard mode
+				 * (see below).  This is our extension of standard mode.
 				 */
 				if (strchr("-./,':; ", *str) == NULL)
 					ereport(ERROR,
@@ -1518,8 +1512,7 @@ static const char *
 get_th(char *num, int type)
 {
 	int			len = strlen(num),
-				last,
-				seclast;
+				last;
 
 	last = *(num + (len - 1));
 	if (!isdigit((unsigned char) last))
@@ -1531,7 +1524,7 @@ get_th(char *num, int type)
 	 * All "teens" (<x>1[0-9]) get 'TH/th', while <x>[02-9][123] still get
 	 * 'ST/st', 'ND/nd', 'RD/rd', respectively
 	 */
-	if ((len > 1) && ((seclast = num[len - 2]) == '1'))
+	if ((len > 1) && (num[len - 2] == '1'))
 		last = 0;
 
 	switch (last)
@@ -2259,7 +2252,7 @@ adjust_partial_year_to_2020(int year)
 
 
 static int
-strspace_len(char *str)
+strspace_len(const char *str)
 {
 	int			len = 0;
 
@@ -2348,12 +2341,12 @@ on_error:
  * and -1 is returned.
  */
 static int
-from_char_parse_int_len(int *dest, char **src, const int len, FormatNode *node,
+from_char_parse_int_len(int *dest, const char **src, const int len, FormatNode *node,
 						bool *have_error)
 {
 	long		result;
 	char		copy[DCH_MAX_ITEM_SIZ + 1];
-	char	   *init = *src;
+	const char *init = *src;
 	int			used;
 
 	/*
@@ -2370,8 +2363,11 @@ from_char_parse_int_len(int *dest, char **src, const int len, FormatNode *node,
 		 * This node is in Fill Mode, or the next node is known to be a
 		 * non-digit value, so we just slurp as many characters as we can get.
 		 */
+		char	   *endptr;
+
 		errno = 0;
-		result = strtol(init, src, 10);
+		result = strtol(init, &endptr, 10);
+		*src = endptr;
 	}
 	else
 	{
@@ -2448,76 +2444,61 @@ on_error:
  * required length explicitly.
  */
 static int
-from_char_parse_int(int *dest, char **src, FormatNode *node, bool *have_error)
+from_char_parse_int(int *dest, const char **src, FormatNode *node, bool *have_error)
 {
 	return from_char_parse_int_len(dest, src, node->key->len, node, have_error);
 }
 
-/* ----------
- * Sequential search with to upper/lower conversion
- * ----------
+/*
+ * Sequentially search null-terminated "array" for a case-insensitive match
+ * to the initial character(s) of "name".
+ *
+ * Returns array index of match, or -1 for no match.
+ *
+ * *len is set to the length of the match, or 0 for no match.
+ *
+ * Case-insensitivity is defined per pg_ascii_tolower, so this is only
+ * suitable for comparisons to ASCII strings.
  */
 static int
-seq_search(char *name, const char *const *array, int type, int max, int *len)
+seq_search_ascii(const char *name, const char *const *array, int *len)
 {
-	const char *p;
+	unsigned char firstc;
 	const char *const *a;
-	char	   *n;
-	int			last,
-				i;
 
 	*len = 0;
 
+	/* empty string can't match anything */
 	if (!*name)
 		return -1;
 
-	/* set first char */
-	if (type == ONE_UPPER || type == ALL_UPPER)
-		*name = pg_toupper((unsigned char) *name);
-	else if (type == ALL_LOWER)
-		*name = pg_tolower((unsigned char) *name);
+	/* we handle first char specially to gain some speed */
+	firstc = pg_ascii_tolower((unsigned char) *name);
 
-	for (last = 0, a = array; *a != NULL; a++)
+	for (a = array; *a != NULL; a++)
 	{
+		const char *p;
+		const char *n;
+
 		/* compare first chars */
-		if (*name != **a)
+		if (pg_ascii_tolower((unsigned char) **a) != firstc)
 			continue;
 
-		for (i = 1, p = *a + 1, n = name + 1;; n++, p++, i++)
+		/* compare rest of string */
+		for (p = *a + 1, n = name + 1;; p++, n++)
 		{
-			/* search fragment (max) only */
-			if (max && i == max)
-			{
-				*len = i;
-				return a - array;
-			}
-			/* full size */
+			/* return success if we matched whole array entry */
 			if (*p == '\0')
 			{
-				*len = i;
+				*len = n - name;
 				return a - array;
 			}
-			/* Not found in array 'a' */
+			/* else, must have another character in "name" ... */
 			if (*n == '\0')
 				break;
-
-			/*
-			 * Convert (but convert new chars only)
-			 */
-			if (i > last)
-			{
-				if (type == ONE_UPPER || type == ALL_LOWER)
-					*n = pg_tolower((unsigned char) *n);
-				else if (type == ALL_UPPER)
-					*n = pg_toupper((unsigned char) *n);
-				last = i;
-			}
-
-#ifdef DEBUG_TO_FROM_CHAR
-			elog(DEBUG_elog_output, "N: %c, P: %c, A: %s (%s)",
-				 *n, *p, *a, name);
-#endif
-			if (*n != *p)
+			/* ... and it must match */
+			if (pg_ascii_tolower((unsigned char) *p) !=
+				pg_ascii_tolower((unsigned char) *n))
 				break;
 		}
 	}
@@ -2526,8 +2507,89 @@ seq_search(char *name, const char *const *array, int type, int max, int *len)
 }
 
 /*
- * Perform a sequential search in 'array' for text matching the first 'max'
- * characters of the source string.
+ * Sequentially search an array of possibly non-English words for
+ * a case-insensitive match to the initial character(s) of "name".
+ *
+ * This has the same API as seq_search_ascii(), but we use a more general
+ * case-folding transformation to achieve case-insensitivity.  Case folding
+ * is done per the rules of the collation identified by "collid".
+ *
+ * The array is treated as const, but we don't declare it that way because
+ * the arrays exported by pg_locale.c aren't const.
+ */
+static int
+seq_search_localized(const char *name, char **array, int *len, Oid collid)
+{
+	char	  **a;
+	char	   *upper_name;
+	char	   *lower_name;
+
+	*len = 0;
+
+	/* empty string can't match anything */
+	if (!*name)
+		return -1;
+
+	/*
+	 * The case-folding processing done below is fairly expensive, so before
+	 * doing that, make a quick pass to see if there is an exact match.
+	 */
+	for (a = array; *a != NULL; a++)
+	{
+		int			element_len = strlen(*a);
+
+		if (strncmp(name, *a, element_len) == 0)
+		{
+			*len = element_len;
+			return a - array;
+		}
+	}
+
+	/*
+	 * Fold to upper case, then to lower case, so that we can match reliably
+	 * even in languages in which case conversions are not injective.
+	 */
+	upper_name = str_toupper(unconstify(char *, name), strlen(name), collid);
+	lower_name = str_tolower(upper_name, strlen(upper_name), collid);
+	pfree(upper_name);
+
+	for (a = array; *a != NULL; a++)
+	{
+		char	   *upper_element;
+		char	   *lower_element;
+		int			element_len;
+
+		/* Likewise upper/lower-case array element */
+		upper_element = str_toupper(*a, strlen(*a), collid);
+		lower_element = str_tolower(upper_element, strlen(upper_element),
+									collid);
+		pfree(upper_element);
+		element_len = strlen(lower_element);
+
+		/* Match? */
+		if (strncmp(lower_name, lower_element, element_len) == 0)
+		{
+			*len = element_len;
+			pfree(lower_element);
+			pfree(lower_name);
+			return a - array;
+		}
+		pfree(lower_element);
+	}
+
+	pfree(lower_name);
+	return -1;
+}
+
+/*
+ * Perform a sequential search in 'array' (or 'localized_array', if that's
+ * not NULL) for an entry matching the first character(s) of the 'src'
+ * string case-insensitively.
+ *
+ * The 'array' is presumed to be English words (all-ASCII), but
+ * if 'localized_array' is supplied, that might be non-English
+ * so we need a more expensive case-folding transformation
+ * (which will follow the rules of the collation 'collid').
  *
  * If a match is found, copy the array index of the match into the integer
  * pointed to by 'dest', advance 'src' to the end of the part of the string
@@ -2535,20 +2597,39 @@ seq_search(char *name, const char *const *array, int type, int max, int *len)
  *
  * If the string doesn't match, throw an error if 'have_error' is NULL,
  * otherwise set '*have_error' and return -1.
+ *
+ * 'node' is used only for error reports: node->key->name identifies the
+ * field type we were searching for.
  */
 static int
-from_char_seq_search(int *dest, char **src, const char *const *array, int type,
-					 int max, FormatNode *node, bool *have_error)
+from_char_seq_search(int *dest, const char **src, const char *const *array,
+					 char **localized_array, Oid collid,
+					 FormatNode *node, bool *have_error)
 {
 	int			len;
 
-	*dest = seq_search(*src, array, type, max, &len);
+	if (localized_array == NULL)
+		*dest = seq_search_ascii(*src, array, &len);
+	else
+		*dest = seq_search_localized(*src, localized_array, &len, collid);
+
 	if (len <= 0)
 	{
-		char		copy[DCH_MAX_ITEM_SIZ + 1];
+		/*
+		 * In the error report, truncate the string at the next whitespace (if
+		 * any) to avoid including irrelevant data.
+		 */
+		char	   *copy = pstrdup(*src);
+		char	   *c;
 
-		Assert(max <= DCH_MAX_ITEM_SIZ);
-		strlcpy(copy, *src, max + 1);
+		for (c = copy; *c; c++)
+		{
+			if (scanner_isspace(*c))
+			{
+				*c = '\0';
+				break;
+			}
+		}
 
 		RETURN_ERROR(ereport(ERROR,
 							 (errcode(ERRCODE_INVALID_DATETIME_FORMAT),
@@ -2651,11 +2732,13 @@ DCH_to_char(FormatNode *node, bool is_interval, TmToChar *in, char *out, Oid col
 					str_numth(s, s, S_TH_TYPE(n->suffix));
 				s += strlen(s);
 				break;
+
 #define DCH_to_char_fsec(frac_fmt, frac_val) \
 				sprintf(s, frac_fmt, (int) (frac_val)); \
 				if (S_THth(n->suffix)) \
 					str_numth(s, s, S_TH_TYPE(n->suffix)); \
-				s += strlen(s);
+				s += strlen(s)
+
 			case DCH_FF1:		/* tenth of second */
 				DCH_to_char_fsec("%01d", in->fsec / 100000);
 				break;
@@ -3155,28 +3238,32 @@ DCH_to_char(FormatNode *node, bool is_interval, TmToChar *in, char *out, Oid col
 	*s = '\0';
 }
 
-/* ----------
- * Process a string as denoted by a list of FormatNodes.
+/*
+ * Process the string 'in' as denoted by the array of FormatNodes 'node[]'.
  * The TmFromChar struct pointed to by 'out' is populated with the results.
+ *
+ * 'collid' identifies the collation to use, if needed.
+ * 'std' specifies standard parsing mode.
+ * If 'have_error' is NULL, then errors are thrown, else '*have_error' is set.
  *
  * Note: we currently don't have any to_interval() function, so there
  * is no need here for INVALID_FOR_INTERVAL checks.
- *
- * If 'have_error' is NULL, then errors are thrown, else '*have_error' is set.
- * ----------
  */
 static void
-DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
-			  bool *have_error)
+DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
+			  Oid collid, bool std, bool *have_error)
 {
 	FormatNode *n;
-	char	   *s;
+	const char *s;
 	int			len,
 				value;
 	bool		fx_mode = std;
 
 	/* number of extra skipped characters (more than given in format string) */
 	int			extra_skip = 0;
+
+	/* cache localized days and months */
+	cache_locale_time();
 
 	for (n = node, s = in; n->type != NODE_TYPE_END && *s != '\0'; n++)
 	{
@@ -3261,7 +3348,19 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			}
 			else
 			{
-				s += pg_mblen(s);
+				int			chlen = pg_mblen(s);
+
+				/*
+				 * Standard mode requires strict match of format characters.
+				 */
+				if (std && n->type == NODE_TYPE_CHAR &&
+					strncmp(s, n->character, chlen) != 0)
+					RETURN_ERROR(ereport(ERROR,
+										 (errcode(ERRCODE_INVALID_DATETIME_FORMAT),
+										  errmsg("unmatched format character \"%s\"",
+												 n->character))));
+
+				s += chlen;
 			}
 			continue;
 		}
@@ -3279,7 +3378,8 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_a_m:
 			case DCH_p_m:
 				from_char_seq_search(&value, &s, ampm_strings_long,
-									 ALL_UPPER, n->key->len, n, have_error);
+									 NULL, InvalidOid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->pm, value % 2, n, have_error);
 				CHECK_ERROR;
@@ -3290,7 +3390,8 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_am:
 			case DCH_pm:
 				from_char_seq_search(&value, &s, ampm_strings,
-									 ALL_UPPER, n->key->len, n, have_error);
+									 NULL, InvalidOid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->pm, value % 2, n, have_error);
 				CHECK_ERROR;
@@ -3403,7 +3504,8 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_a_d:
 			case DCH_b_c:
 				from_char_seq_search(&value, &s, adbc_strings_long,
-									 ALL_UPPER, n->key->len, n, have_error);
+									 NULL, InvalidOid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->bc, value % 2, n, have_error);
 				CHECK_ERROR;
@@ -3413,7 +3515,8 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_ad:
 			case DCH_bc:
 				from_char_seq_search(&value, &s, adbc_strings,
-									 ALL_UPPER, n->key->len, n, have_error);
+									 NULL, InvalidOid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->bc, value % 2, n, have_error);
 				CHECK_ERROR;
@@ -3421,8 +3524,10 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_MONTH:
 			case DCH_Month:
 			case DCH_month:
-				from_char_seq_search(&value, &s, months_full, ONE_UPPER,
-									 MAX_MONTH_LEN, n, have_error);
+				from_char_seq_search(&value, &s, months_full,
+									 S_TM(n->suffix) ? localized_full_months : NULL,
+									 collid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->mm, value + 1, n, have_error);
 				CHECK_ERROR;
@@ -3430,8 +3535,10 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_MON:
 			case DCH_Mon:
 			case DCH_mon:
-				from_char_seq_search(&value, &s, months, ONE_UPPER,
-									 MAX_MON_LEN, n, have_error);
+				from_char_seq_search(&value, &s, months,
+									 S_TM(n->suffix) ? localized_abbrev_months : NULL,
+									 collid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->mm, value + 1, n, have_error);
 				CHECK_ERROR;
@@ -3444,8 +3551,10 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_DAY:
 			case DCH_Day:
 			case DCH_day:
-				from_char_seq_search(&value, &s, days, ONE_UPPER,
-									 MAX_DAY_LEN, n, have_error);
+				from_char_seq_search(&value, &s, days,
+									 S_TM(n->suffix) ? localized_full_days : NULL,
+									 collid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->d, value, n, have_error);
 				CHECK_ERROR;
@@ -3454,8 +3563,10 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 			case DCH_DY:
 			case DCH_Dy:
 			case DCH_dy:
-				from_char_seq_search(&value, &s, days, ONE_UPPER,
-									 MAX_DY_LEN, n, have_error);
+				from_char_seq_search(&value, &s, days_short,
+									 S_TM(n->suffix) ? localized_abbrev_days : NULL,
+									 collid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->d, value, n, have_error);
 				CHECK_ERROR;
@@ -3571,16 +3682,10 @@ DCH_from_char(FormatNode *node, char *in, TmFromChar *out, bool std,
 				SKIP_THth(s, n->suffix);
 				break;
 			case DCH_RM:
-				from_char_seq_search(&value, &s, rm_months_upper,
-									 ALL_UPPER, MAX_RM_LEN, n, have_error);
-				CHECK_ERROR;
-				from_char_set_int(&out->mm, MONTHS_PER_YEAR - value,
-								  n, have_error);
-				CHECK_ERROR;
-				break;
 			case DCH_rm:
 				from_char_seq_search(&value, &s, rm_months_lower,
-									 ALL_LOWER, MAX_RM_LEN, n, have_error);
+									 NULL, InvalidOid,
+									 n, have_error);
 				CHECK_ERROR;
 				from_char_set_int(&out->mm, MONTHS_PER_YEAR - value,
 								  n, have_error);
@@ -3798,7 +3903,7 @@ DCH_cache_getnew(const char *str, bool std)
 		elog(DEBUG_elog_output, "OLD: '%s' AGE: %d", old->str, old->age);
 #endif
 		old->valid = false;
-		StrNCpy(old->str, str, DCH_CACHE_SIZE + 1);
+		strlcpy(old->str, str, DCH_CACHE_SIZE + 1);
 		old->age = (++DCHCounter);
 		/* caller is expected to fill format, then set valid */
 		return old;
@@ -3812,7 +3917,7 @@ DCH_cache_getnew(const char *str, bool std)
 		DCHCache[n_DCHCache] = ent = (DCHCacheEntry *)
 			MemoryContextAllocZero(TopMemoryContext, sizeof(DCHCacheEntry));
 		ent->valid = false;
-		StrNCpy(ent->str, str, DCH_CACHE_SIZE + 1);
+		strlcpy(ent->str, str, DCH_CACHE_SIZE + 1);
 		ent->std = std;
 		ent->age = (++DCHCounter);
 		/* caller is expected to fill format, then set valid */
@@ -4046,13 +4151,15 @@ to_timestamp(PG_FUNCTION_ARGS)
 {
 	text	   *date_txt = PG_GETARG_TEXT_PP(0);
 	text	   *fmt = PG_GETARG_TEXT_PP(1);
+	Oid			collid = PG_GET_COLLATION();
 	Timestamp	result;
 	int			tz;
 	struct pg_tm tm;
 	fsec_t		fsec;
 	int			fprec;
 
-	do_to_timestamp(date_txt, fmt, false, &tm, &fsec, &fprec, NULL, NULL);
+	do_to_timestamp(date_txt, fmt, collid, false,
+					&tm, &fsec, &fprec, NULL, NULL);
 
 	/* Use the specified time zone, if any. */
 	if (tm.tm_zone)
@@ -4087,11 +4194,13 @@ to_date(PG_FUNCTION_ARGS)
 {
 	text	   *date_txt = PG_GETARG_TEXT_PP(0);
 	text	   *fmt = PG_GETARG_TEXT_PP(1);
+	Oid			collid = PG_GET_COLLATION();
 	DateADT		result;
 	struct pg_tm tm;
 	fsec_t		fsec;
 
-	do_to_timestamp(date_txt, fmt, false, &tm, &fsec, NULL, NULL, NULL);
+	do_to_timestamp(date_txt, fmt, collid, false,
+					&tm, &fsec, NULL, NULL, NULL);
 
 	/* Prevent overflow in Julian-day routines */
 	if (!IS_VALID_JULIAN(tm.tm_year, tm.tm_mon, tm.tm_mday))
@@ -4113,25 +4222,31 @@ to_date(PG_FUNCTION_ARGS)
 }
 
 /*
- * Convert the 'date_txt' input to a datetime type using argument 'fmt' as a format string.
+ * Convert the 'date_txt' input to a datetime type using argument 'fmt'
+ * as a format string.  The collation 'collid' may be used for case-folding
+ * rules in some cases.  'strict' specifies standard parsing mode.
+ *
  * The actual data type (returned in 'typid', 'typmod') is determined by
  * the presence of date/time/zone components in the format string.
  *
- * When timezone component is present, the corresponding offset is set to '*tz'.
+ * When timezone component is present, the corresponding offset is
+ * returned in '*tz'.
  *
  * If 'have_error' is NULL, then errors are thrown, else '*have_error' is set
  * and zero value is returned.
  */
 Datum
-parse_datetime(text *date_txt, text *fmt, bool strict, Oid *typid,
-			   int32 *typmod, int *tz, bool *have_error)
+parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
+			   Oid *typid, int32 *typmod, int *tz,
+			   bool *have_error)
 {
 	struct pg_tm tm;
 	fsec_t		fsec;
-	int			fprec = 0;
+	int			fprec;
 	uint32		flags;
 
-	do_to_timestamp(date_txt, fmt, strict, &tm, &fsec, &fprec, &flags, have_error);
+	do_to_timestamp(date_txt, fmt, collid, strict,
+					&tm, &fsec, &fprec, &flags, have_error);
 	CHECK_ERROR;
 
 	*typmod = fprec ? fprec : -1;	/* fractional part precision */
@@ -4293,21 +4408,21 @@ on_error:
  * Parse the 'date_txt' according to 'fmt', return results as a struct pg_tm,
  * fractional seconds, and fractional precision.
  *
+ * 'collid' identifies the collation to use, if needed.
+ * 'std' specifies standard parsing mode.
+ * Bit mask of date/time/zone components found in 'fmt' is returned in 'flags',
+ * if that is not NULL.
+ * If 'have_error' is NULL, then errors are thrown, else '*have_error' is set.
+ *
  * We parse 'fmt' into a list of FormatNodes, which is then passed to
  * DCH_from_char to populate a TmFromChar with the parsed contents of
  * 'date_txt'.
  *
  * The TmFromChar is then analysed and converted into the final results in
- * struct 'tm' and 'fsec'.
- *
- * Bit mask of date/time/zone components found in 'fmt' is returned in 'flags'.
- *
- * 'std' specifies standard parsing mode.
- *
- * If 'have_error' is NULL, then errors are thrown, else '*have_error' is set.
+ * struct 'tm', 'fsec', and 'fprec'.
  */
 static void
-do_to_timestamp(text *date_txt, text *fmt, bool std,
+do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 				struct pg_tm *tm, fsec_t *fsec, int *fprec,
 				uint32 *flags, bool *have_error)
 {
@@ -4318,11 +4433,18 @@ do_to_timestamp(text *date_txt, text *fmt, bool std,
 	int			fmask;
 	bool		incache = false;
 
+	Assert(tm != NULL);
+	Assert(fsec != NULL);
+
 	date_str = text_to_cstring(date_txt);
 
 	ZERO_tmfc(&tmfc);
 	ZERO_tm(tm);
 	*fsec = 0;
+	if (fprec)
+		*fprec = 0;
+	if (flags)
+		*flags = 0;
 	fmask = 0;					/* bit mask for ValidateDate() */
 
 	fmt_len = VARSIZE_ANY_EXHDR(fmt);
@@ -4360,7 +4482,7 @@ do_to_timestamp(text *date_txt, text *fmt, bool std,
 		/* dump_index(DCH_keywords, DCH_index); */
 #endif
 
-		DCH_from_char(format, date_str, &tmfc, std, have_error);
+		DCH_from_char(format, date_str, &tmfc, collid, std, have_error);
 		CHECK_ERROR;
 
 		pfree(fmt_str);
@@ -4447,8 +4569,11 @@ do_to_timestamp(text *date_txt, text *fmt, bool std,
 		{
 			/* If a 4-digit year is provided, we use that and ignore CC. */
 			tm->tm_year = tmfc.year;
-			if (tmfc.bc && tm->tm_year > 0)
-				tm->tm_year = -(tm->tm_year - 1);
+			if (tmfc.bc)
+				tm->tm_year = -tm->tm_year;
+			/* correct for our representation of BC years */
+			if (tm->tm_year < 0)
+				tm->tm_year++;
 		}
 		fmask |= DTK_M(YEAR);
 	}
@@ -4690,7 +4815,7 @@ NUM_cache_getnew(const char *str)
 		elog(DEBUG_elog_output, "OLD: \"%s\" AGE: %d", old->str, old->age);
 #endif
 		old->valid = false;
-		StrNCpy(old->str, str, NUM_CACHE_SIZE + 1);
+		strlcpy(old->str, str, NUM_CACHE_SIZE + 1);
 		old->age = (++NUMCounter);
 		/* caller is expected to fill format and Num, then set valid */
 		return old;
@@ -4704,7 +4829,7 @@ NUM_cache_getnew(const char *str)
 		NUMCache[n_NUMCache] = ent = (NUMCacheEntry *)
 			MemoryContextAllocZero(TopMemoryContext, sizeof(NUMCacheEntry));
 		ent->valid = false;
-		StrNCpy(ent->str, str, NUM_CACHE_SIZE + 1);
+		strlcpy(ent->str, str, NUM_CACHE_SIZE + 1);
 		ent->age = (++NUMCounter);
 		/* caller is expected to fill format and Num, then set valid */
 		++n_NUMCache;
@@ -4823,9 +4948,9 @@ NUM_cache(int len, NUMDesc *Num, text *pars_str, bool *shouldFree)
 static char *
 int_to_roman(int number)
 {
-	int			len = 0,
-				num = 0;
-	char	   *p = NULL,
+	int			len,
+				num;
+	char	   *p,
 			   *result,
 				numstr[12];
 
@@ -4841,7 +4966,7 @@ int_to_roman(int number)
 
 	for (p = numstr; *p != '\0'; p++, --len)
 	{
-		num = *p - 49;			/* 48 ascii + 1 */
+		num = *p - ('0' + 1);
 		if (num < 0)
 			continue;
 
@@ -4916,7 +5041,7 @@ NUM_prepare_locale(NUMProc *Np)
 		if (lconv->thousands_sep && *lconv->thousands_sep)
 			Np->L_thousands_sep = lconv->thousands_sep;
 		/* Make sure thousands separator doesn't match decimal point symbol. */
-		else if (strcmp(Np->decimal, ",") !=0)
+		else if (strcmp(Np->decimal, ",") != 0)
 			Np->L_thousands_sep = ",";
 		else
 			Np->L_thousands_sep = ".";
@@ -5962,10 +6087,8 @@ numeric_to_number(PG_FUNCTION_ARGS)
 	if (IS_MULTI(&Num))
 	{
 		Numeric		x;
-		Numeric		a = DatumGetNumeric(DirectFunctionCall1(int4_numeric,
-															Int32GetDatum(10)));
-		Numeric		b = DatumGetNumeric(DirectFunctionCall1(int4_numeric,
-															Int32GetDatum(-Num.multi)));
+		Numeric		a = int64_to_numeric(10);
+		Numeric		b = int64_to_numeric(-Num.multi);
 
 		x = DatumGetNumeric(DirectFunctionCall2(numeric_power,
 												NumericGetDatum(a),
@@ -6009,7 +6132,7 @@ numeric_to_char(PG_FUNCTION_ARGS)
 		x = DatumGetNumeric(DirectFunctionCall2(numeric_round,
 												NumericGetDatum(value),
 												Int32GetDatum(0)));
-		numstr = orgnum =
+		numstr =
 			int_to_roman(DatumGetInt32(DirectFunctionCall1(numeric_int4,
 														   NumericGetDatum(x))));
 	}
@@ -6020,9 +6143,12 @@ numeric_to_char(PG_FUNCTION_ARGS)
 		/*
 		 * numeric_out_sci() does not emit a sign for positive numbers.  We
 		 * need to add a space in this case so that positive and negative
-		 * numbers are aligned.  We also have to do the right thing for NaN.
+		 * numbers are aligned.  Also must check for NaN/infinity cases, which
+		 * we handle the same way as in float8_to_char.
 		 */
-		if (strcmp(orgnum, "NaN") == 0)
+		if (strcmp(orgnum, "NaN") == 0 ||
+			strcmp(orgnum, "Infinity") == 0 ||
+			strcmp(orgnum, "-Infinity") == 0)
 		{
 			/*
 			 * Allow 6 characters for the leading sign, the decimal point,
@@ -6051,10 +6177,8 @@ numeric_to_char(PG_FUNCTION_ARGS)
 
 		if (IS_MULTI(&Num))
 		{
-			Numeric		a = DatumGetNumeric(DirectFunctionCall1(int4_numeric,
-																Int32GetDatum(10)));
-			Numeric		b = DatumGetNumeric(DirectFunctionCall1(int4_numeric,
-																Int32GetDatum(Num.multi)));
+			Numeric		a = int64_to_numeric(10);
+			Numeric		b = int64_to_numeric(Num.multi);
 
 			x = DatumGetNumeric(DirectFunctionCall2(numeric_power,
 													NumericGetDatum(a),
@@ -6127,7 +6251,7 @@ int4_to_char(PG_FUNCTION_ARGS)
 	 * On DateType depend part (int32)
 	 */
 	if (IS_ROMAN(&Num))
-		numstr = orgnum = int_to_roman(value);
+		numstr = int_to_roman(value);
 	else if (IS_EEEE(&Num))
 	{
 		/* we can do it easily because float8 won't lose any precision */
@@ -6223,22 +6347,18 @@ int8_to_char(PG_FUNCTION_ARGS)
 	if (IS_ROMAN(&Num))
 	{
 		/* Currently don't support int8 conversion to roman... */
-		numstr = orgnum = int_to_roman(DatumGetInt32(
-													 DirectFunctionCall1(int84, Int64GetDatum(value))));
+		numstr = int_to_roman(DatumGetInt32(DirectFunctionCall1(int84, Int64GetDatum(value))));
 	}
 	else if (IS_EEEE(&Num))
 	{
 		/* to avoid loss of precision, must go via numeric not float8 */
-		Numeric		val;
-
-		val = DatumGetNumeric(DirectFunctionCall1(int8_numeric,
-												  Int64GetDatum(value)));
-		orgnum = numeric_out_sci(val, Num.post);
+		orgnum = numeric_out_sci(int64_to_numeric(value),
+								 Num.post);
 
 		/*
 		 * numeric_out_sci() does not emit a sign for positive numbers.  We
 		 * need to add a space in this case so that positive and negative
-		 * numbers are aligned.  We don't have to worry about NaN here.
+		 * numbers are aligned.  We don't have to worry about NaN/inf here.
 		 */
 		if (*orgnum != '-')
 		{
@@ -6323,13 +6443,12 @@ float4_to_char(PG_FUNCTION_ARGS)
 	int			out_pre_spaces = 0,
 				sign = 0;
 	char	   *numstr,
-			   *orgnum,
 			   *p;
 
 	NUM_TOCHAR_prepare;
 
 	if (IS_ROMAN(&Num))
-		numstr = orgnum = int_to_roman((int) rint(value));
+		numstr = int_to_roman((int) rint(value));
 	else if (IS_EEEE(&Num))
 	{
 		if (isnan(value) || isinf(value))
@@ -6345,20 +6464,19 @@ float4_to_char(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			numstr = orgnum = psprintf("%+.*e", Num.post, value);
+			numstr = psprintf("%+.*e", Num.post, value);
 
 			/*
 			 * Swap a leading positive sign for a space.
 			 */
-			if (*orgnum == '+')
-				*orgnum = ' ';
-
-			numstr = orgnum;
+			if (*numstr == '+')
+				*numstr = ' ';
 		}
 	}
 	else
 	{
 		float4		val = value;
+		char	   *orgnum;
 		int			numstr_pre_len;
 
 		if (IS_MULTI(&Num))
@@ -6369,7 +6487,7 @@ float4_to_char(PG_FUNCTION_ARGS)
 			Num.pre += Num.multi;
 		}
 
-		orgnum = (char *) psprintf("%.0f", fabs(val));
+		orgnum = psprintf("%.0f", fabs(val));
 		numstr_pre_len = strlen(orgnum);
 
 		/* adjust post digits to fit max float digits */
@@ -6427,13 +6545,12 @@ float8_to_char(PG_FUNCTION_ARGS)
 	int			out_pre_spaces = 0,
 				sign = 0;
 	char	   *numstr,
-			   *orgnum,
 			   *p;
 
 	NUM_TOCHAR_prepare;
 
 	if (IS_ROMAN(&Num))
-		numstr = orgnum = int_to_roman((int) rint(value));
+		numstr = int_to_roman((int) rint(value));
 	else if (IS_EEEE(&Num))
 	{
 		if (isnan(value) || isinf(value))
@@ -6449,20 +6566,19 @@ float8_to_char(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			numstr = orgnum = (char *) psprintf("%+.*e", Num.post, value);
+			numstr = psprintf("%+.*e", Num.post, value);
 
 			/*
 			 * Swap a leading positive sign for a space.
 			 */
-			if (*orgnum == '+')
-				*orgnum = ' ';
-
-			numstr = orgnum;
+			if (*numstr == '+')
+				*numstr = ' ';
 		}
 	}
 	else
 	{
 		float8		val = value;
+		char	   *orgnum;
 		int			numstr_pre_len;
 
 		if (IS_MULTI(&Num))
@@ -6472,6 +6588,7 @@ float8_to_char(PG_FUNCTION_ARGS)
 			val = value * multi;
 			Num.pre += Num.multi;
 		}
+
 		orgnum = psprintf("%.0f", fabs(val));
 		numstr_pre_len = strlen(orgnum);
 

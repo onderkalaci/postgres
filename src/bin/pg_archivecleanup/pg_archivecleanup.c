@@ -269,7 +269,8 @@ usage(void)
 			 "Or for use as a standalone archive cleaner:\n"
 			 "e.g.\n"
 			 "  pg_archivecleanup /mnt/server/archiverdir 000000010000000000000010.00000020.backup\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
 /*------------ MAIN ----------------------------------------*/
@@ -301,7 +302,7 @@ main(int argc, char **argv)
 		switch (c)
 		{
 			case 'd':			/* Debug mode */
-				pg_logging_set_level(PG_LOG_DEBUG);
+				pg_logging_increase_verbosity();
 				break;
 			case 'n':			/* Dry-Run mode */
 				dryrun = true;

@@ -3,7 +3,7 @@
  * brin_validate.c
  *	  Opclass validator for BRIN.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -104,6 +104,9 @@ brinvalidate(Oid opclassoid)
 				ok = check_amproc_signature(procform->amproc, BOOLOID, true,
 											3, 3, INTERNALOID, INTERNALOID,
 											INTERNALOID);
+				break;
+			case BRIN_PROCNUM_OPTIONS:
+				ok = check_amoptsproc_signature(procform->amproc);
 				break;
 			default:
 				/* Complain if it's not a valid optional proc number */

@@ -4,7 +4,7 @@
  *	  definition of the "operator" system catalog (pg_operator)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_operator.h
@@ -41,7 +41,7 @@ CATALOG(pg_operator,2617,OperatorRelationId)
 	/* operator owner */
 	Oid			oprowner BKI_DEFAULT(PGUID);
 
-	/* 'l', 'r', or 'b' */
+	/* 'l' for prefix or 'b' for infix */
 	char		oprkind BKI_DEFAULT(b);
 
 	/* can be used in merge join? */
@@ -50,10 +50,10 @@ CATALOG(pg_operator,2617,OperatorRelationId)
 	/* can be used in hash join? */
 	bool		oprcanhash BKI_DEFAULT(f);
 
-	/* left arg type, or 0 if 'l' oprkind */
+	/* left arg type, or 0 if prefix operator */
 	Oid			oprleft BKI_LOOKUP(pg_type);
 
-	/* right arg type, or 0 if 'r' oprkind */
+	/* right arg type */
 	Oid			oprright BKI_LOOKUP(pg_type);
 
 	/* result datatype */
@@ -81,6 +81,11 @@ CATALOG(pg_operator,2617,OperatorRelationId)
  * ----------------
  */
 typedef FormData_pg_operator *Form_pg_operator;
+
+DECLARE_UNIQUE_INDEX(pg_operator_oid_index, 2688, on pg_operator using btree(oid oid_ops));
+#define OperatorOidIndexId	2688
+DECLARE_UNIQUE_INDEX(pg_operator_oprname_l_r_n_index, 2689, on pg_operator using btree(oprname name_ops, oprleft oid_ops, oprright oid_ops, oprnamespace oid_ops));
+#define OperatorNameNspIndexId	2689
 
 
 extern ObjectAddress OperatorCreate(const char *operatorName,

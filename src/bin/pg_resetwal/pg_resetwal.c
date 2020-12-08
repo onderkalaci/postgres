@@ -20,7 +20,7 @@
  * step 2 ...
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_resetwal/pg_resetwal.c
@@ -76,7 +76,7 @@ static int	WalSegSz;
 static int	set_wal_segsize;
 
 static void CheckDataVersion(void);
-static bool ReadControlFile(void);
+static bool read_controlfile(void);
 static void GuessControlValues(void);
 static void PrintControlValues(bool guessed);
 static void PrintNewControlValues(void);
@@ -393,7 +393,7 @@ main(int argc, char *argv[])
 	/*
 	 * Attempt to read the existing pg_control file
 	 */
-	if (!ReadControlFile())
+	if (!read_controlfile())
 		GuessControlValues();
 
 	/*
@@ -424,14 +424,14 @@ main(int argc, char *argv[])
 	 * if any, includes these values.)
 	 */
 	if (set_xid_epoch != -1)
-		ControlFile.checkPointCopy.nextFullXid =
+		ControlFile.checkPointCopy.nextXid =
 			FullTransactionIdFromEpochAndXid(set_xid_epoch,
-											 XidFromFullTransactionId(ControlFile.checkPointCopy.nextFullXid));
+											 XidFromFullTransactionId(ControlFile.checkPointCopy.nextXid));
 
 	if (set_xid != 0)
 	{
-		ControlFile.checkPointCopy.nextFullXid =
-			FullTransactionIdFromEpochAndXid(EpochFromFullTransactionId(ControlFile.checkPointCopy.nextFullXid),
+		ControlFile.checkPointCopy.nextXid =
+			FullTransactionIdFromEpochAndXid(EpochFromFullTransactionId(ControlFile.checkPointCopy.nextXid),
 											 set_xid);
 
 		/*
@@ -578,7 +578,7 @@ CheckDataVersion(void)
  * to the current format.  (Currently we don't do anything of the sort.)
  */
 static bool
-ReadControlFile(void)
+read_controlfile(void)
 {
 	int			fd;
 	int			len;
@@ -684,7 +684,7 @@ GuessControlValues(void)
 	ControlFile.checkPointCopy.ThisTimeLineID = 1;
 	ControlFile.checkPointCopy.PrevTimeLineID = 1;
 	ControlFile.checkPointCopy.fullPageWrites = false;
-	ControlFile.checkPointCopy.nextFullXid =
+	ControlFile.checkPointCopy.nextXid =
 		FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId);
 	ControlFile.checkPointCopy.nextOid = FirstBootstrapObjectId;
 	ControlFile.checkPointCopy.nextMulti = FirstMultiXactId;
@@ -756,8 +756,8 @@ PrintControlValues(bool guessed)
 	printf(_("Latest checkpoint's full_page_writes: %s\n"),
 		   ControlFile.checkPointCopy.fullPageWrites ? _("on") : _("off"));
 	printf(_("Latest checkpoint's NextXID:          %u:%u\n"),
-		   EpochFromFullTransactionId(ControlFile.checkPointCopy.nextFullXid),
-		   XidFromFullTransactionId(ControlFile.checkPointCopy.nextFullXid));
+		   EpochFromFullTransactionId(ControlFile.checkPointCopy.nextXid),
+		   XidFromFullTransactionId(ControlFile.checkPointCopy.nextXid));
 	printf(_("Latest checkpoint's NextOID:          %u\n"),
 		   ControlFile.checkPointCopy.nextOid);
 	printf(_("Latest checkpoint's NextMultiXactId:  %u\n"),
@@ -847,7 +847,7 @@ PrintNewControlValues(void)
 	if (set_xid != 0)
 	{
 		printf(_("NextXID:                              %u\n"),
-			   XidFromFullTransactionId(ControlFile.checkPointCopy.nextFullXid));
+			   XidFromFullTransactionId(ControlFile.checkPointCopy.nextXid));
 		printf(_("OldestXID:                            %u\n"),
 			   ControlFile.checkPointCopy.oldestXid);
 		printf(_("OldestXID's DB:                       %u\n"),
@@ -857,7 +857,7 @@ PrintNewControlValues(void)
 	if (set_xid_epoch != -1)
 	{
 		printf(_("NextXID epoch:                        %u\n"),
-			   EpochFromFullTransactionId(ControlFile.checkPointCopy.nextFullXid));
+			   EpochFromFullTransactionId(ControlFile.checkPointCopy.nextXid));
 	}
 
 	if (set_oldest_commit_ts_xid != 0)
@@ -1223,5 +1223,6 @@ usage(void)
 	printf(_("  -x, --next-transaction-id=XID  set next transaction ID\n"));
 	printf(_("      --wal-segsize=SIZE         size of WAL segments, in megabytes\n"));
 	printf(_("  -?, --help                     show this help, then exit\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }

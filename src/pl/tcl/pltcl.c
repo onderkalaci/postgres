@@ -30,6 +30,7 @@
 #include "parser/parse_type.h"
 #include "pgstat.h"
 #include "tcop/tcopprot.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -431,9 +432,9 @@ _PG_init(void)
 	 * stdout and stderr on DeleteInterp
 	 ************************************************************/
 	if ((pltcl_hold_interp = Tcl_CreateInterp()) == NULL)
-		elog(ERROR, "could not create master Tcl interpreter");
+		elog(ERROR, "could not create dummy Tcl interpreter");
 	if (Tcl_Init(pltcl_hold_interp) == TCL_ERROR)
-		elog(ERROR, "could not initialize master Tcl interpreter");
+		elog(ERROR, "could not initialize dummy Tcl interpreter");
 
 	/************************************************************
 	 * Create the hash table for working interpreters
@@ -488,14 +489,14 @@ pltcl_init_interp(pltcl_interp_desc *interp_desc, Oid prolang, bool pltrusted)
 	char		interpname[32];
 
 	/************************************************************
-	 * Create the Tcl interpreter as a slave of pltcl_hold_interp.
+	 * Create the Tcl interpreter subsidiary to pltcl_hold_interp.
 	 * Note: Tcl automatically does Tcl_Init in the untrusted case,
 	 * and it's not wanted in the trusted case.
 	 ************************************************************/
-	snprintf(interpname, sizeof(interpname), "slave_%u", interp_desc->user_id);
+	snprintf(interpname, sizeof(interpname), "subsidiary_%u", interp_desc->user_id);
 	if ((interp = Tcl_CreateSlave(pltcl_hold_interp, interpname,
 								  pltrusted ? 1 : 0)) == NULL)
-		elog(ERROR, "could not create slave Tcl interpreter");
+		elog(ERROR, "could not create subsidiary Tcl interpreter");
 
 	/************************************************************
 	 * Initialize the query hash table associated with interpreter
@@ -767,7 +768,10 @@ pltcl_handler(PG_FUNCTION_ARGS, bool pltrusted)
 	PG_FINALLY();
 	{
 		/* Restore static pointer, then clean up the prodesc refcount if any */
-		/* (We're being paranoid in case an error is thrown in context deletion) */
+		/*
+		 * (We're being paranoid in case an error is thrown in context
+		 * deletion)
+		 */
 		pltcl_current_call_state = save_call_state;
 		if (current_call_state.prodesc != NULL)
 		{
@@ -1329,7 +1333,8 @@ pltcl_event_trigger_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 	Tcl_ListObjAppendElement(NULL, tcl_cmd,
 							 Tcl_NewStringObj(utf_e2u(tdata->event), -1));
 	Tcl_ListObjAppendElement(NULL, tcl_cmd,
-							 Tcl_NewStringObj(utf_e2u(tdata->tag), -1));
+							 Tcl_NewStringObj(utf_e2u(GetCommandTagName(tdata->tag)),
+											  -1));
 
 	tcl_rc = Tcl_EvalObjEx(interp, tcl_cmd, (TCL_EVAL_DIRECT | TCL_EVAL_GLOBAL));
 
@@ -1527,7 +1532,7 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 					rettype == RECORDOID)
 					 /* okay */ ;
 				else if (rettype == TRIGGEROID ||
-						 rettype == EVTTRIGGEROID)
+						 rettype == EVENT_TRIGGEROID)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("trigger functions can only be called as triggers")));
@@ -2746,8 +2751,7 @@ pltcl_SPI_execute_plan(ClientData cdata, Tcl_Interp *interp,
 		if (strlen(nulls) != qdesc->nargs)
 		{
 			Tcl_SetObjResult(interp,
-							 Tcl_NewStringObj(
-											  "length of nulls string doesn't match number of arguments",
+							 Tcl_NewStringObj("length of nulls string doesn't match number of arguments",
 											  -1));
 			return TCL_ERROR;
 		}
@@ -2762,9 +2766,8 @@ pltcl_SPI_execute_plan(ClientData cdata, Tcl_Interp *interp,
 		if (i >= objc)
 		{
 			Tcl_SetObjResult(interp,
-							 Tcl_NewStringObj(
-											  "argument list length doesn't match number of arguments for query"
-											  ,-1));
+							 Tcl_NewStringObj("argument list length doesn't match number of arguments for query",
+											  -1));
 			return TCL_ERROR;
 		}
 
@@ -2780,9 +2783,8 @@ pltcl_SPI_execute_plan(ClientData cdata, Tcl_Interp *interp,
 		if (callObjc != qdesc->nargs)
 		{
 			Tcl_SetObjResult(interp,
-							 Tcl_NewStringObj(
-											  "argument list length doesn't match number of arguments for query"
-											  ,-1));
+							 Tcl_NewStringObj("argument list length doesn't match number of arguments for query",
+											  -1));
 			return TCL_ERROR;
 		}
 	}

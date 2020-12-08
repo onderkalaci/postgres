@@ -77,13 +77,15 @@
    The general format of the <filename>pg_hba.conf</filename> file is
    a set of records, one per line. Blank lines are ignored, as is any
    text after the <literal>#</literal> comment character.
-   Records cannot be continued across lines.
+   A record can be continued onto the next line by ending the line with
+   a backslash. (Backslashes are not special except at the end of a line.)
    A record is made
    up of a number of fields which are separated by spaces and/or tabs.
    Fields can contain white space if the field value is double-quoted.
    Quoting one of the keywords in a database, user, or address field (e.g.,
    <literal>all</literal> or <literal>replication</literal>) makes the word lose its special
    meaning, and just match a database, user, or host with that name.
+   Backslash line continuation applies even within quoted text or comments.
   </para>
 
   <para>
@@ -99,17 +101,19 @@
   </para>
 
   <para>
-   A record can have one of the seven formats
+   A record can have several formats:
 <synopsis>
-local      <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-host       <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-hostssl    <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-hostnossl  <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-host       <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-hostssl    <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-hostnossl  <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-hostgssenc <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
-hostnogssenc <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>  <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+local         <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>auth-method</replaceable> <optional><replaceable>auth-options</replaceable></optional>
+host          <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>     <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostssl       <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>     <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostnossl     <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>     <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostgssenc    <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>     <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostnogssenc  <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>address</replaceable>     <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+host          <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>      <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostssl       <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>      <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostnossl     <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>      <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostgssenc    <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>      <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
+hostnogssenc  <replaceable>database</replaceable>  <replaceable>user</replaceable>  <replaceable>IP-address</replaceable>  <replaceable>IP-mask</replaceable>      <replaceable>auth-method</replaceable>  <optional><replaceable>auth-options</replaceable></optional>
 </synopsis>
    The meaning of the fields is as follows:
 
@@ -356,8 +360,7 @@ hostnogssenc <replaceable>database</replaceable>  <replaceable>user</replaceable
       </para>
 
       <para>
-       This field only applies to <literal>host</literal>,
-       <literal>hostssl</literal>, and <literal>hostnossl</literal> records.
+       These fields do not apply to <literal>local</literal> records.
       </para>
 
       <note>
@@ -409,8 +412,7 @@ hostnogssenc <replaceable>database</replaceable>  <replaceable>user</replaceable
       </para>
 
       <para>
-       These fields only apply to <literal>host</literal>,
-       <literal>hostssl</literal>, and <literal>hostnossl</literal> records.
+       These fields do not apply to <literal>local</literal> records.
       </para>
      </listitem>
     </varlistentry>
@@ -821,7 +823,7 @@ local   db1,db2,@demodbs  all                                   md5
 <synopsis>
 <replaceable>map-name</replaceable> <replaceable>system-username</replaceable> <replaceable>database-username</replaceable>
 </synopsis>
-   Comments and whitespace are handled in the same way as in
+   Comments, whitespace and line continuations are handled in the same way as in
    <filename>pg_hba.conf</filename>.  The
    <replaceable>map-name</replaceable> is an arbitrary name that will be used to
    refer to this mapping in <filename>pg_hba.conf</filename>. The other
@@ -911,8 +913,102 @@ omicron         bryanh                  guest1
 
  <sect1 id="auth-methods">
   <title>Authentication Methods</title>
+
   <para>
-   The following sections describe the authentication methods in more detail.
+   <productname>PostgreSQL</productname> provides various methods for
+   authenticating users:
+
+   <itemizedlist>
+    <listitem>
+     <para>
+      <link linkend="auth-trust">Trust authentication</link>, which
+      simply trusts that users are who they say they are.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-password">Password authentication</link>, which
+      requires that users send a password.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="gssapi-auth">GSSAPI authentication</link>, which
+      relies on a GSSAPI-compatible security library.  Typically this is
+      used to access an authentication server such as a Kerberos or
+      Microsoft Active Directory server.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="sspi-auth">SSPI authentication</link>, which
+      uses a Windows-specific protocol similar to GSSAPI.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-ident">Ident authentication</link>, which
+      relies on an <quote>Identification Protocol</quote>
+      (<ulink url="https://tools.ietf.org/html/rfc1413">RFC 1413</ulink>)
+      service on the client's machine.  (On local Unix-socket connections,
+      this is treated as peer authentication.)
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-peer">Peer authentication</link>, which
+      relies on operating system facilities to identify the process at the
+      other end of a local connection.  This is not supported for remote
+      connections.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-ldap">LDAP authentication</link>, which
+      relies on an LDAP authentication server.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-radius">RADIUS authentication</link>, which
+      relies on a RADIUS authentication server.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-cert">Certificate authentication</link>, which
+      requires an SSL connection and authenticates users by checking the
+      SSL certificate they send.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-pam">PAM authentication</link>, which
+      relies on a PAM (Pluggable Authentication Modules) library.
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-bsd">BSD authentication</link>, which
+      relies on the BSD Authentication framework (currently available
+      only on OpenBSD).
+     </para>
+    </listitem>
+   </itemizedlist>
+  </para>
+
+  <para>
+   Peer authentication is usually recommendable for local connections,
+   though trust authentication might be sufficient in some circumstances.
+   Password authentication is the easiest choice for remote connections.
+   All the other options require some kind of external security
+   infrastructure (usually an authentication server or a certificate
+   authority for issuing SSL certificates), or are platform-specific.
+  </para>
+
+  <para>
+   The following sections describe each of these authentication methods
+   in more detail.
   </para>
  </sect1>
 
@@ -1103,7 +1199,8 @@ omicron         bryanh                  guest1
 
    <para>
     <productname>GSSAPI</productname> is an industry-standard protocol
-    for secure authentication defined in RFC 2743.
+    for secure authentication defined in
+    <ulink url="https://tools.ietf.org/html/rfc2743">RFC 2743</ulink>.
 
     <productname>PostgreSQL</productname>
     supports <productname>GSSAPI</productname> for use as either an encrypted,
@@ -1408,7 +1505,8 @@ omicron         bryanh                  guest1
 
    <para>
     The <quote>Identification Protocol</quote> is described in
-    RFC 1413. Virtually every Unix-like
+    <ulink url="https://tools.ietf.org/html/rfc1413">RFC 1413</ulink>.
+    Virtually every Unix-like
     operating system ships with an ident server that listens on TCP
     port 113 by default. The basic functionality of an ident server
     is to answer questions like <quote>What user initiated the
@@ -1576,8 +1674,8 @@ omicron         bryanh                  guest1
        <para>
         Set to 1 to make the connection between PostgreSQL and the LDAP server
         use TLS encryption.  This uses the <literal>StartTLS</literal>
-        operation per RFC 4513.  See also the <literal>ldapscheme</literal>
-        option for an alternative.
+        operation per <ulink url="https://tools.ietf.org/html/rfc4513">RFC 4513</ulink>.
+        See also the <literal>ldapscheme</literal> option for an alternative.
        </para>
       </listitem>
      </varlistentry>
@@ -1671,7 +1769,8 @@ omicron         bryanh                  guest1
        <term><literal>ldapurl</literal></term>
        <listitem>
         <para>
-         An RFC 4516 LDAP URL.  This is an alternative way to write some of the
+         An <ulink url="https://tools.ietf.org/html/rfc4516">RFC 4516</ulink>
+         LDAP URL.  This is an alternative way to write some of the
          other LDAP options in a more compact and standard form.  The format is
 <synopsis>
 ldap[s]://<replaceable>host</replaceable>[:<replaceable>port</replaceable>]/<replaceable>basedn</replaceable>[?[<replaceable>attribute</replaceable>][?[<replaceable>scope</replaceable>][?[<replaceable>filter</replaceable>]]]]
@@ -1732,7 +1831,8 @@ ldap[s]://<replaceable>host</replaceable>[:<replaceable>port</replaceable>]/<rep
      If <productname>PostgreSQL</productname> was compiled with
      <productname>OpenLDAP</productname> as the LDAP client library, the
      <literal>ldapserver</literal> setting may be omitted.  In that case, a
-     list of host names and ports is looked up via RFC 2782 DNS SRV records.
+     list of host names and ports is looked up via
+     <ulink url="https://tools.ietf.org/html/rfc2782">RFC 2782</ulink> DNS SRV records.
      The name <literal>_ldap._tcp.DOMAIN</literal> is looked up, where
      <literal>DOMAIN</literal> is extracted from <literal>ldapbasedn</literal>.
    </para>
@@ -1949,13 +2049,10 @@ host ... radius radiusservers="server1,server2" radiussecrets="""secret one"",""
    </para>
 
    <para>
-    In a <filename>pg_hba.conf</filename> record specifying certificate
-    authentication, the authentication option <literal>clientcert</literal> is
-    assumed to be <literal>verify-ca</literal> or <literal>verify-full</literal>,
-    and it cannot be turned off since a client certificate is necessary for this
-    method. What the <literal>cert</literal> method adds to the basic
-    <literal>clientcert</literal> certificate validity test is a check that the
-    <literal>cn</literal> attribute matches the database user name.
+    It is redundant to use the <literal>clientcert</literal> option with
+    <literal>cert</literal> authentication because <literal>cert</literal>
+    authentication is effectively <literal>trust</literal> authentication
+    with <literal>clientcert=verify-full</literal>.
    </para>
   </sect1>
 

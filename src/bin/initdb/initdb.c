@@ -38,7 +38,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/initdb/initdb.c
@@ -67,6 +67,7 @@
 #include "common/file_utils.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
+#include "common/string.h"
 #include "common/username.h"
 #include "fe_utils/string_utils.h"
 #include "getaddrinfo.h"
@@ -151,8 +152,6 @@ static int	wal_segment_size_mb;
 static const char *progname;
 static int	encodingid;
 static char *bki_file;
-static char *desc_file;
-static char *shdesc_file;
 static char *hba_file;
 static char *ident_file;
 static char *conf_file;
@@ -332,12 +331,9 @@ escape_quotes(const char *src)
 
 /*
  * Escape a field value to be inserted into the BKI data.
- * Here, we first run the value through escape_quotes (which
- * will be inverted by the backend's scanstr() function) and
- * then overlay special processing of double quotes, which
- * bootscanner.l will only accept as data if converted to octal
- * representation ("\042").  We always wrap the value in double
- * quotes, even if that isn't strictly necessary.
+ * Run the value through escape_quotes (which will be inverted
+ * by the backend's DeescapeQuotedString() function), then wrap
+ * the value in single quotes, even if that isn't strictly necessary.
  */
 static char *
 escape_quotes_bki(const char *src)
@@ -346,30 +342,13 @@ escape_quotes_bki(const char *src)
 	char	   *data = escape_quotes(src);
 	char	   *resultp;
 	char	   *datap;
-	int			nquotes = 0;
 
-	/* count double quotes in data */
-	datap = data;
-	while ((datap = strchr(datap, '"')) != NULL)
-	{
-		nquotes++;
-		datap++;
-	}
-
-	result = (char *) pg_malloc(strlen(data) + 3 + nquotes * 3);
+	result = (char *) pg_malloc(strlen(data) + 3);
 	resultp = result;
-	*resultp++ = '"';
+	*resultp++ = '\'';
 	for (datap = data; *datap; datap++)
-	{
-		if (*datap == '"')
-		{
-			strcpy(resultp, "\\042");
-			resultp += 4;
-		}
-		else
-			*resultp++ = *datap;
-	}
-	*resultp++ = '"';
+		*resultp++ = *datap;
+	*resultp++ = '\'';
 	*resultp = '\0';
 
 	free(data);
@@ -469,14 +448,11 @@ filter_lines_with_token(char **lines, const char *token)
 static char **
 readfile(const char *path)
 {
-	FILE	   *infile;
-	int			maxlength = 1,
-				linelen = 0;
-	int			nlines = 0;
-	int			n;
 	char	  **result;
-	char	   *buffer;
-	int			c;
+	FILE	   *infile;
+	StringInfoData line;
+	int			maxlines;
+	int			n;
 
 	if ((infile = fopen(path, "r")) == NULL)
 	{
@@ -484,39 +460,28 @@ readfile(const char *path)
 		exit(1);
 	}
 
-	/* pass over the file twice - the first time to size the result */
+	initStringInfo(&line);
 
-	while ((c = fgetc(infile)) != EOF)
-	{
-		linelen++;
-		if (c == '\n')
-		{
-			nlines++;
-			if (linelen > maxlength)
-				maxlength = linelen;
-			linelen = 0;
-		}
-	}
+	maxlines = 1024;
+	result = (char **) pg_malloc(maxlines * sizeof(char *));
 
-	/* handle last line without a terminating newline (yuck) */
-	if (linelen)
-		nlines++;
-	if (linelen > maxlength)
-		maxlength = linelen;
-
-	/* set up the result and the line buffer */
-	result = (char **) pg_malloc((nlines + 1) * sizeof(char *));
-	buffer = (char *) pg_malloc(maxlength + 1);
-
-	/* now reprocess the file and store the lines */
-	rewind(infile);
 	n = 0;
-	while (fgets(buffer, maxlength + 1, infile) != NULL && n < nlines)
-		result[n++] = pg_strdup(buffer);
+	while (pg_get_line_buf(infile, &line))
+	{
+		/* make sure there will be room for a trailing NULL pointer */
+		if (n >= maxlines - 1)
+		{
+			maxlines *= 2;
+			result = (char **) pg_realloc(result, maxlines * sizeof(char *));
+		}
+
+		result[n++] = pg_strdup(line.data);
+	}
+	result[n] = NULL;
+
+	pfree(line.data);
 
 	fclose(infile);
-	free(buffer);
-	result[n] = NULL;
 
 	return result;
 }
@@ -690,6 +655,10 @@ static const struct tsearch_config_match tsearch_config_languages[] =
 {
 	{"arabic", "ar"},
 	{"arabic", "Arabic"},
+	{"basque", "eu"},
+	{"basque", "Basque"},
+	{"catalan", "ca"},
+	{"catalan", "Catalan"},
 	{"danish", "da"},
 	{"danish", "Danish"},
 	{"dutch", "nl"},
@@ -706,6 +675,8 @@ static const struct tsearch_config_match tsearch_config_languages[] =
 	{"german", "German"},
 	{"greek", "el"},
 	{"greek", "Greek"},
+	{"hindi", "hi"},
+	{"hindi", "Hindi"},
 	{"hungarian", "hu"},
 	{"hungarian", "Hungarian"},
 	{"indonesian", "id"},
@@ -1200,12 +1171,18 @@ setup_config(void)
 							  "#update_process_title = off");
 #endif
 
-	if (strcmp(authmethodlocal, "scram-sha-256") == 0 ||
-		strcmp(authmethodhost, "scram-sha-256") == 0)
+	/*
+	 * Change password_encryption setting to md5 if md5 was chosen as an
+	 * authentication method, unless scram-sha-256 was also chosen.
+	 */
+	if ((strcmp(authmethodlocal, "md5") == 0 &&
+		 strcmp(authmethodhost, "scram-sha-256") != 0) ||
+		(strcmp(authmethodhost, "md5") == 0 &&
+		 strcmp(authmethodlocal, "scram-sha-256") != 0))
 	{
 		conflines = replace_token(conflines,
-								  "#password_encryption = md5",
-								  "password_encryption = scram-sha-256");
+								  "#password_encryption = scram-sha-256",
+								  "password_encryption = md5");
 	}
 
 	/*
@@ -1462,7 +1439,7 @@ setup_auth(FILE *cmdfd)
 
 	if (superuser_password)
 		PG_CMD_PRINTF("ALTER USER \"%s\" WITH PASSWORD E'%s';\n\n",
-					   username, escape_quotes(superuser_password));
+					  username, escape_quotes(superuser_password));
 }
 
 /*
@@ -1471,23 +1448,25 @@ setup_auth(FILE *cmdfd)
 static void
 get_su_pwd(void)
 {
-	char		pwd1[100];
-	char		pwd2[100];
+	char	   *pwd1;
 
 	if (pwprompt)
 	{
 		/*
 		 * Read password from terminal
 		 */
+		char	   *pwd2;
+
 		printf("\n");
 		fflush(stdout);
-		simple_prompt("Enter new superuser password: ", pwd1, sizeof(pwd1), false);
-		simple_prompt("Enter it again: ", pwd2, sizeof(pwd2), false);
+		pwd1 = simple_prompt("Enter new superuser password: ", false);
+		pwd2 = simple_prompt("Enter it again: ", false);
 		if (strcmp(pwd1, pwd2) != 0)
 		{
 			fprintf(stderr, _("Passwords didn't match.\n"));
 			exit(1);
 		}
+		free(pwd2);
 	}
 	else
 	{
@@ -1500,7 +1479,6 @@ get_su_pwd(void)
 		 * for now.
 		 */
 		FILE	   *pwf = fopen(pwfilename, "r");
-		int			i;
 
 		if (!pwf)
 		{
@@ -1508,7 +1486,8 @@ get_su_pwd(void)
 						 pwfilename);
 			exit(1);
 		}
-		if (!fgets(pwd1, sizeof(pwd1), pwf))
+		pwd1 = pg_get_line(pwf);
+		if (!pwd1)
 		{
 			if (ferror(pwf))
 				pg_log_error("could not read password from file \"%s\": %m",
@@ -1520,12 +1499,10 @@ get_su_pwd(void)
 		}
 		fclose(pwf);
 
-		i = strlen(pwd1);
-		while (i > 0 && (pwd1[i - 1] == '\r' || pwd1[i - 1] == '\n'))
-			pwd1[--i] = '\0';
+		(void) pg_strip_crlf(pwd1);
 	}
 
-	superuser_password = pg_strdup(pwd1);
+	superuser_password = pwd1;
 }
 
 /*
@@ -1644,38 +1621,11 @@ setup_sysviews(FILE *cmdfd)
 }
 
 /*
- * load description data
+ * fill in extra description data
  */
 static void
 setup_description(FILE *cmdfd)
 {
-	PG_CMD_PUTS("CREATE TEMP TABLE tmp_pg_description ( "
-				"	objoid oid, "
-				"	classname name, "
-				"	objsubid int4, "
-				"	description text);\n\n");
-
-	PG_CMD_PRINTF("COPY tmp_pg_description FROM E'%s';\n\n",
-				   escape_quotes(desc_file));
-
-	PG_CMD_PUTS("INSERT INTO pg_description "
-				" SELECT t.objoid, c.oid, t.objsubid, t.description "
-				"  FROM tmp_pg_description t, pg_class c "
-				"    WHERE c.relname = t.classname;\n\n");
-
-	PG_CMD_PUTS("CREATE TEMP TABLE tmp_pg_shdescription ( "
-				" objoid oid, "
-				" classname name, "
-				" description text);\n\n");
-
-	PG_CMD_PRINTF("COPY tmp_pg_shdescription FROM E'%s';\n\n",
-				   escape_quotes(shdesc_file));
-
-	PG_CMD_PUTS("INSERT INTO pg_shdescription "
-				" SELECT t.objoid, c.oid, t.description "
-				"  FROM tmp_pg_shdescription t, pg_class c "
-				"   WHERE c.relname = t.classname;\n\n");
-
 	/* Create default descriptions for operator implementation functions */
 	PG_CMD_PUTS("WITH funcdescs AS ( "
 				"SELECT p.oid as p_oid, o.oid as o_oid, oprname "
@@ -1689,13 +1639,6 @@ setup_description(FILE *cmdfd)
 				"  AND NOT EXISTS (SELECT 1 FROM pg_description "
 				"   WHERE objoid = o_oid AND classoid = 'pg_operator'::regclass"
 				"         AND description LIKE 'deprecated%');\n\n");
-
-	/*
-	 * Even though the tables are temp, drop them explicitly so they don't get
-	 * copied into template0/postgres databases.
-	 */
-	PG_CMD_PUTS("DROP TABLE tmp_pg_description;\n\n");
-	PG_CMD_PUTS("DROP TABLE tmp_pg_shdescription;\n\n");
 }
 
 /*
@@ -1710,8 +1653,8 @@ setup_collation(FILE *cmdfd)
 	 * that it wins if libc defines a locale named ucs_basic.
 	 */
 	PG_CMD_PRINTF("INSERT INTO pg_collation (oid, collname, collnamespace, collowner, collprovider, collisdeterministic, collencoding, collcollate, collctype)"
-				   "VALUES (pg_nextoid('pg_catalog.pg_collation', 'oid', 'pg_catalog.pg_collation_oid_index'), 'ucs_basic', 'pg_catalog'::regnamespace, %u, '%c', true, %d, 'C', 'C');\n\n",
-				   BOOTSTRAP_SUPERUSERID, COLLPROVIDER_LIBC, PG_UTF8);
+				  "VALUES (pg_nextoid('pg_catalog.pg_collation', 'oid', 'pg_catalog.pg_collation_oid_index'), 'ucs_basic', 'pg_catalog'::regnamespace, %u, '%c', true, %d, 'C', 'C');\n\n",
+				  BOOTSTRAP_SUPERUSERID, COLLPROVIDER_LIBC, PG_UTF8);
 
 	/* Now import all collations we can find in the operating system */
 	PG_CMD_PUTS("SELECT pg_import_system_collations('pg_catalog');\n\n");
@@ -1849,7 +1792,7 @@ setup_privileges(FILE *cmdfd)
 		"    SELECT"
 		"        oid,"
 		"        (SELECT oid FROM pg_class WHERE "
-		"		  relname = 'pg_largeobject_metadata'),"
+		"         relname = 'pg_largeobject_metadata'),"
 		"        0,"
 		"        lomacl,"
 		"        'i'"
@@ -1874,7 +1817,7 @@ setup_privileges(FILE *cmdfd)
 		"    SELECT"
 		"        oid,"
 		"        (SELECT oid FROM pg_class WHERE "
-		"		  relname = 'pg_foreign_data_wrapper'),"
+		"         relname = 'pg_foreign_data_wrapper'),"
 		"        0,"
 		"        fdwacl,"
 		"        'i'"
@@ -1887,7 +1830,7 @@ setup_privileges(FILE *cmdfd)
 		"    SELECT"
 		"        oid,"
 		"        (SELECT oid FROM pg_class "
-		"		  WHERE relname = 'pg_foreign_server'),"
+		"         WHERE relname = 'pg_foreign_server'),"
 		"        0,"
 		"        srvacl,"
 		"        'i'"
@@ -1954,15 +1897,15 @@ setup_schema(FILE *cmdfd)
 	free(lines);
 
 	PG_CMD_PRINTF("UPDATE information_schema.sql_implementation_info "
-				   "  SET character_value = '%s' "
-				   "  WHERE implementation_info_name = 'DBMS VERSION';\n\n",
-				   infoversion);
+				  "  SET character_value = '%s' "
+				  "  WHERE implementation_info_name = 'DBMS VERSION';\n\n",
+				  infoversion);
 
 	PG_CMD_PRINTF("COPY information_schema.sql_features "
-				   "  (feature_id, feature_name, sub_feature_id, "
-				   "  sub_feature_name, is_supported, comments) "
-				   " FROM E'%s';\n\n",
-				   escape_quotes(features_file));
+				  "  (feature_id, feature_name, sub_feature_id, "
+				  "  sub_feature_name, is_supported, comments) "
+				  " FROM E'%s';\n\n",
+				  escape_quotes(features_file));
 }
 
 /*
@@ -2043,7 +1986,7 @@ make_postgres(FILE *cmdfd)
  * signal handler in case we are interrupted.
  *
  * The Windows runtime docs at
- * http://msdn.microsoft.com/library/en-us/vclib/html/_crt_signal.asp
+ * https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
  * specifically forbid a number of things being done from a signal handler,
  * including IO, memory allocation and system calls, and only allow jmpbuf
  * if you are handling SIGFPE.
@@ -2052,11 +1995,10 @@ make_postgres(FILE *cmdfd)
  * exit() directly.
  *
  * Also note the behaviour of Windows with SIGINT, which says this:
- *	 Note	SIGINT is not supported for any Win32 application, including
- *	 Windows 98/Me and Windows NT/2000/XP. When a CTRL+C interrupt occurs,
- *	 Win32 operating systems generate a new thread to specifically handle
- *	 that interrupt. This can cause a single-thread application such as UNIX,
- *	 to become multithreaded, resulting in unexpected behavior.
+ *  SIGINT is not supported for any Win32 application. When a CTRL+C interrupt
+ *  occurs, Win32 operating systems generate a new thread to specifically
+ *  handle that interrupt. This can cause a single-thread application, such as
+ *  one in UNIX, to become multithreaded and cause unexpected behavior.
  *
  * I have no idea how to handle this. (Strange they call UNIX an application!)
  * So this will need some testing on Windows.
@@ -2359,7 +2301,8 @@ usage(const char *progname)
 	printf(_("  -?, --help                show this help, then exit\n"));
 	printf(_("\nIf the data directory is not specified, the environment variable PGDATA\n"
 			 "is used.\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
 static void
@@ -2403,12 +2346,7 @@ check_need_password(const char *authmethodlocal, const char *authmethodhost)
 		 strcmp(authmethodhost, "scram-sha-256") == 0) &&
 		!(pwprompt || pwfilename))
 	{
-		pg_log_error("must specify a password for the superuser to enable %s authentication",
-					 (strcmp(authmethodlocal, "md5") == 0 ||
-					  strcmp(authmethodlocal, "password") == 0 ||
-					  strcmp(authmethodlocal, "scram-sha-256") == 0)
-					 ? authmethodlocal
-					 : authmethodhost);
+		pg_log_error("must specify a password for the superuser to enable password authentication");
 		exit(1);
 	}
 }
@@ -2467,15 +2405,15 @@ setup_bin_paths(const char *argv0)
 			strlcpy(full_path, progname, sizeof(full_path));
 
 		if (ret == -1)
-			pg_log_error("The program \"postgres\" is needed by %s but was not found in the\n"
+			pg_log_error("The program \"%s\" is needed by %s but was not found in the\n"
 						 "same directory as \"%s\".\n"
 						 "Check your installation.",
-						 progname, full_path);
+						 "postgres", progname, full_path);
 		else
-			pg_log_error("The program \"postgres\" was found by \"%s\"\n"
+			pg_log_error("The program \"%s\" was found by \"%s\"\n"
 						 "but was not the same version as %s.\n"
 						 "Check your installation.",
-						 full_path, progname);
+						 "postgres", full_path, progname);
 		exit(1);
 	}
 
@@ -2586,8 +2524,6 @@ void
 setup_data_file_paths(void)
 {
 	set_input(&bki_file, "postgres.bki");
-	set_input(&desc_file, "postgres.description");
-	set_input(&shdesc_file, "postgres.shdescription");
 	set_input(&hba_file, "pg_hba.conf.sample");
 	set_input(&ident_file, "pg_ident.conf.sample");
 	set_input(&conf_file, "postgresql.conf.sample");
@@ -2602,13 +2538,11 @@ setup_data_file_paths(void)
 				"VERSION=%s\n"
 				"PGDATA=%s\nshare_path=%s\nPGPATH=%s\n"
 				"POSTGRES_SUPERUSERNAME=%s\nPOSTGRES_BKI=%s\n"
-				"POSTGRES_DESCR=%s\nPOSTGRES_SHDESCR=%s\n"
 				"POSTGRESQL_CONF_SAMPLE=%s\n"
 				"PG_HBA_SAMPLE=%s\nPG_IDENT_SAMPLE=%s\n",
 				PG_VERSION,
 				pg_data, share_path, bin_path,
 				username, bki_file,
-				desc_file, shdesc_file,
 				conf_file,
 				hba_file, ident_file);
 		if (show_setting)
@@ -2616,8 +2550,6 @@ setup_data_file_paths(void)
 	}
 
 	check_input(bki_file);
-	check_input(desc_file);
-	check_input(shdesc_file);
 	check_input(hba_file);
 	check_input(ident_file);
 	check_input(conf_file);

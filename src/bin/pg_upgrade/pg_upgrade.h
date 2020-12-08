@@ -1,7 +1,7 @@
 /*
  *	pg_upgrade.h
  *
- *	Copyright (c) 2010-2019, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2020, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.h
  */
 
@@ -65,7 +65,6 @@ extern char *output_files[];
 
 #ifndef WIN32
 #define pg_mv_file			rename
-#define pg_link_file		link
 #define PATH_SEPARATOR		'/'
 #define PATH_QUOTE	'\''
 #define RM_CMD				"rm -f"
@@ -76,7 +75,6 @@ extern char *output_files[];
 #define ECHO_BLANK	""
 #else
 #define pg_mv_file			pgrename
-#define pg_link_file		win32_pghardlink
 #define PATH_SEPARATOR		'\\'
 #define PATH_QUOTE	'"'
 #define RM_CMD				"DEL /q"
@@ -294,6 +292,7 @@ typedef struct
 	transferMode transfer_mode; /* copy files or link them? */
 	int			jobs;			/* number of processes/threads to use */
 	char	   *socketdir;		/* directory to use for Unix sockets */
+	bool		ind_coll_unknown;	/* mark unknown index collation versions */
 } UserOpts;
 
 typedef struct
@@ -335,12 +334,10 @@ void		check_and_dump_old_cluster(bool live_check);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
-void		output_completion_banner(char *analyze_script_file_name,
-									 char *deletion_script_file_name);
+void		output_completion_banner(char *deletion_script_file_name);
 void		check_cluster_versions(void);
 void		check_cluster_compatibility(bool live_check);
 void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
-void		create_script_for_cluster_analyze(char **analyze_script_file_name);
 
 
 /* controldata.c */

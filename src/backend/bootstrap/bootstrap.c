@@ -4,7 +4,7 @@
  *	  routines to support running postgres in 'bootstrap' mode
  *	bootstrap mode is used to create the initial template database
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -53,14 +53,12 @@
 uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
 
 
-#define ALLOC(t, c) \
-	((t *) MemoryContextAllocZero(TopMemoryContext, (unsigned)(c) * sizeof(t)))
-
 static void CheckerModeMain(void);
 static void BootstrapModeMain(void);
 static void bootstrap_signals(void);
 static void ShutdownAuxiliaryProcess(int code, Datum arg);
 static Form_pg_attribute AllocateAttribute(void);
+static void populate_typ_array(void);
 static Oid	gettype(char *type);
 static void cleanup(void);
 
@@ -101,55 +99,55 @@ struct typinfo
 };
 
 static const struct typinfo TypInfo[] = {
-	{"bool", BOOLOID, 0, 1, true, 'c', 'p', InvalidOid,
+	{"bool", BOOLOID, 0, 1, true, TYPALIGN_CHAR, TYPSTORAGE_PLAIN, InvalidOid,
 	F_BOOLIN, F_BOOLOUT},
-	{"bytea", BYTEAOID, 0, -1, false, 'i', 'x', InvalidOid,
+	{"bytea", BYTEAOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_BYTEAIN, F_BYTEAOUT},
-	{"char", CHAROID, 0, 1, true, 'c', 'p', InvalidOid,
+	{"char", CHAROID, 0, 1, true, TYPALIGN_CHAR, TYPSTORAGE_PLAIN, InvalidOid,
 	F_CHARIN, F_CHAROUT},
-	{"int2", INT2OID, 0, 2, true, 's', 'p', InvalidOid,
+	{"int2", INT2OID, 0, 2, true, TYPALIGN_SHORT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_INT2IN, F_INT2OUT},
-	{"int4", INT4OID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"int4", INT4OID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_INT4IN, F_INT4OUT},
-	{"float4", FLOAT4OID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"float4", FLOAT4OID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_FLOAT4IN, F_FLOAT4OUT},
-	{"name", NAMEOID, CHAROID, NAMEDATALEN, false, 'c', 'p', C_COLLATION_OID,
+	{"name", NAMEOID, CHAROID, NAMEDATALEN, false, TYPALIGN_CHAR, TYPSTORAGE_PLAIN, C_COLLATION_OID,
 	F_NAMEIN, F_NAMEOUT},
-	{"regclass", REGCLASSOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"regclass", REGCLASSOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGCLASSIN, F_REGCLASSOUT},
-	{"regproc", REGPROCOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"regproc", REGPROCOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGPROCIN, F_REGPROCOUT},
-	{"regtype", REGTYPEOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"regtype", REGTYPEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGTYPEIN, F_REGTYPEOUT},
-	{"regrole", REGROLEOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"regrole", REGROLEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGROLEIN, F_REGROLEOUT},
-	{"regnamespace", REGNAMESPACEOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"regnamespace", REGNAMESPACEOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_REGNAMESPACEIN, F_REGNAMESPACEOUT},
-	{"text", TEXTOID, 0, -1, false, 'i', 'x', DEFAULT_COLLATION_OID,
+	{"text", TEXTOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_TEXTIN, F_TEXTOUT},
-	{"oid", OIDOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"oid", OIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_OIDIN, F_OIDOUT},
-	{"tid", TIDOID, 0, 6, false, 's', 'p', InvalidOid,
+	{"tid", TIDOID, 0, 6, false, TYPALIGN_SHORT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_TIDIN, F_TIDOUT},
-	{"xid", XIDOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"xid", XIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_XIDIN, F_XIDOUT},
-	{"cid", CIDOID, 0, 4, true, 'i', 'p', InvalidOid,
+	{"cid", CIDOID, 0, 4, true, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_CIDIN, F_CIDOUT},
-	{"pg_node_tree", PGNODETREEOID, 0, -1, false, 'i', 'x', DEFAULT_COLLATION_OID,
+	{"pg_node_tree", PG_NODE_TREEOID, 0, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_PG_NODE_TREE_IN, F_PG_NODE_TREE_OUT},
-	{"int2vector", INT2VECTOROID, INT2OID, -1, false, 'i', 'p', InvalidOid,
+	{"int2vector", INT2VECTOROID, INT2OID, -1, false, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_INT2VECTORIN, F_INT2VECTOROUT},
-	{"oidvector", OIDVECTOROID, OIDOID, -1, false, 'i', 'p', InvalidOid,
+	{"oidvector", OIDVECTOROID, OIDOID, -1, false, TYPALIGN_INT, TYPSTORAGE_PLAIN, InvalidOid,
 	F_OIDVECTORIN, F_OIDVECTOROUT},
-	{"_int4", INT4ARRAYOID, INT4OID, -1, false, 'i', 'x', InvalidOid,
+	{"_int4", INT4ARRAYOID, INT4OID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_text", 1009, TEXTOID, -1, false, 'i', 'x', DEFAULT_COLLATION_OID,
+	{"_text", 1009, TEXTOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, DEFAULT_COLLATION_OID,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_oid", 1028, OIDOID, -1, false, 'i', 'x', InvalidOid,
+	{"_oid", 1028, OIDOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_char", 1002, CHAROID, -1, false, 'i', 'x', InvalidOid,
+	{"_char", 1002, CHAROID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT},
-	{"_aclitem", 1034, ACLITEMOID, -1, false, 'i', 'x', InvalidOid,
+	{"_aclitem", 1034, ACLITEMOID, -1, false, TYPALIGN_INT, TYPSTORAGE_EXTENDED, InvalidOid,
 	F_ARRAY_IN, F_ARRAY_OUT}
 };
 
@@ -314,36 +312,28 @@ AuxiliaryProcessMain(int argc, char *argv[])
 		proc_exit(1);
 	}
 
-	/*
-	 * Identify myself via ps
-	 */
-	if (IsUnderPostmaster)
+	switch (MyAuxProcType)
 	{
-		const char *statmsg;
-
-		switch (MyAuxProcType)
-		{
-			case StartupProcess:
-				statmsg = pgstat_get_backend_desc(B_STARTUP);
-				break;
-			case BgWriterProcess:
-				statmsg = pgstat_get_backend_desc(B_BG_WRITER);
-				break;
-			case CheckpointerProcess:
-				statmsg = pgstat_get_backend_desc(B_CHECKPOINTER);
-				break;
-			case WalWriterProcess:
-				statmsg = pgstat_get_backend_desc(B_WAL_WRITER);
-				break;
-			case WalReceiverProcess:
-				statmsg = pgstat_get_backend_desc(B_WAL_RECEIVER);
-				break;
-			default:
-				statmsg = "??? process";
-				break;
-		}
-		init_ps_display(statmsg, "", "", "");
+		case StartupProcess:
+			MyBackendType = B_STARTUP;
+			break;
+		case BgWriterProcess:
+			MyBackendType = B_BG_WRITER;
+			break;
+		case CheckpointerProcess:
+			MyBackendType = B_CHECKPOINTER;
+			break;
+		case WalWriterProcess:
+			MyBackendType = B_WAL_WRITER;
+			break;
+		case WalReceiverProcess:
+			MyBackendType = B_WAL_RECEIVER;
+			break;
+		default:
+			MyBackendType = B_INVALID;
 	}
+	if (IsUnderPostmaster)
+		init_ps_display(NULL);
 
 	/* Acquire configuration parameters, unless inherited from postmaster */
 	if (!IsUnderPostmaster)
@@ -591,46 +581,24 @@ ShutdownAuxiliaryProcess(int code, Datum arg)
 
 /* ----------------
  *		boot_openrel
+ *
+ * Execute BKI OPEN command.
  * ----------------
  */
 void
 boot_openrel(char *relname)
 {
 	int			i;
-	struct typmap **app;
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tup;
 
 	if (strlen(relname) >= NAMEDATALEN)
 		relname[NAMEDATALEN - 1] = '\0';
 
+	/*
+	 * pg_type must be filled before any OPEN command is executed, hence we
+	 * can now populate the Typ array if we haven't yet.
+	 */
 	if (Typ == NULL)
-	{
-		/* We can now load the pg_type data */
-		rel = table_open(TypeRelationId, NoLock);
-		scan = table_beginscan_catalog(rel, 0, NULL);
-		i = 0;
-		while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-			++i;
-		table_endscan(scan);
-		app = Typ = ALLOC(struct typmap *, i + 1);
-		while (i-- > 0)
-			*app++ = ALLOC(struct typmap, 1);
-		*app = NULL;
-		scan = table_beginscan_catalog(rel, 0, NULL);
-		app = Typ;
-		while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-		{
-			(*app)->am_oid = ((Form_pg_type) GETSTRUCT(tup))->oid;
-			memcpy((char *) &(*app)->am_typ,
-				   (char *) GETSTRUCT(tup),
-				   sizeof((*app)->am_typ));
-			app++;
-		}
-		table_endscan(scan);
-		table_close(rel, NoLock);
-	}
+		populate_typ_array();
 
 	if (boot_reldesc != NULL)
 		closerel(NULL);
@@ -778,25 +746,18 @@ DefineAttr(char *name, char *type, int attnum, int nullness)
 
 		/*
 		 * Mark as "not null" if type is fixed-width and prior columns are
-		 * too.  This corresponds to case where column can be accessed
-		 * directly via C struct declaration.
-		 *
-		 * oidvector and int2vector are also treated as not-nullable, even
-		 * though they are no longer fixed-width.
+		 * likewise fixed-width and not-null.  This corresponds to case where
+		 * column can be accessed directly via C struct declaration.
 		 */
-#define MARKNOTNULL(att) \
-		((att)->attlen > 0 || \
-		 (att)->atttypid == OIDVECTOROID || \
-		 (att)->atttypid == INT2VECTOROID)
-
-		if (MARKNOTNULL(attrtypes[attnum]))
+		if (attrtypes[attnum]->attlen > 0)
 		{
 			int			i;
 
 			/* check earlier attributes */
 			for (i = 0; i < attnum; i++)
 			{
-				if (!attrtypes[i]->attnotnull)
+				if (attrtypes[i]->attlen <= 0 ||
+					!attrtypes[i]->attnotnull)
 					break;
 			}
 			if (i == attnum)
@@ -905,6 +866,52 @@ cleanup(void)
 }
 
 /* ----------------
+ *		populate_typ_array
+ *
+ * Load the Typ array by reading pg_type.
+ * ----------------
+ */
+static void
+populate_typ_array(void)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	int			nalloc;
+	int			i;
+
+	Assert(Typ == NULL);
+
+	nalloc = 512;
+	Typ = (struct typmap **)
+		MemoryContextAlloc(TopMemoryContext, nalloc * sizeof(struct typmap *));
+
+	rel = table_open(TypeRelationId, NoLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	i = 0;
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_type typForm = (Form_pg_type) GETSTRUCT(tup);
+
+		/* make sure there will be room for a trailing NULL pointer */
+		if (i >= nalloc - 1)
+		{
+			nalloc *= 2;
+			Typ = (struct typmap **)
+				repalloc(Typ, nalloc * sizeof(struct typmap *));
+		}
+		Typ[i] = (struct typmap *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(struct typmap));
+		Typ[i]->am_oid = typForm->oid;
+		memcpy(&(Typ[i]->am_typ), typForm, sizeof(Typ[i]->am_typ));
+		i++;
+	}
+	Typ[i] = NULL;				/* Fill trailing NULL pointer */
+	table_endscan(scan);
+	table_close(rel, NoLock);
+}
+
+/* ----------------
  *		gettype
  *
  * NB: this is really ugly; it will return an integer index into TypInfo[],
@@ -918,14 +925,10 @@ cleanup(void)
 static Oid
 gettype(char *type)
 {
-	int			i;
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tup;
-	struct typmap **app;
-
 	if (Typ != NULL)
 	{
+		struct typmap **app;
+
 		for (app = Typ; *app != NULL; app++)
 		{
 			if (strncmp(NameStr((*app)->am_typ.typname), type, NAMEDATALEN) == 0)
@@ -937,33 +940,16 @@ gettype(char *type)
 	}
 	else
 	{
+		int			i;
+
 		for (i = 0; i < n_types; i++)
 		{
 			if (strncmp(type, TypInfo[i].name, NAMEDATALEN) == 0)
 				return i;
 		}
+		/* Not in TypInfo, so we'd better be able to read pg_type now */
 		elog(DEBUG4, "external type: %s", type);
-		rel = table_open(TypeRelationId, NoLock);
-		scan = table_beginscan_catalog(rel, 0, NULL);
-		i = 0;
-		while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-			++i;
-		table_endscan(scan);
-		app = Typ = ALLOC(struct typmap *, i + 1);
-		while (i-- > 0)
-			*app++ = ALLOC(struct typmap, 1);
-		*app = NULL;
-		scan = table_beginscan_catalog(rel, 0, NULL);
-		app = Typ;
-		while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-		{
-			(*app)->am_oid = ((Form_pg_type) GETSTRUCT(tup))->oid;
-			memmove((char *) &(*app++)->am_typ,
-					(char *) GETSTRUCT(tup),
-					sizeof((*app)->am_typ));
-		}
-		table_endscan(scan);
-		table_close(rel, NoLock);
+		populate_typ_array();
 		return gettype(type);
 	}
 	elog(ERROR, "unrecognized type \"%s\"", type);

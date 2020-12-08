@@ -3,7 +3,7 @@
  * parse_func.c
  *		handle function calls in parser
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -91,11 +91,12 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	bool		is_column = (fn == NULL);
 	List	   *agg_order = (fn ? fn->agg_order : NIL);
 	Expr	   *agg_filter = NULL;
+	WindowDef  *over = (fn ? fn->over : NULL);
 	bool		agg_within_group = (fn ? fn->agg_within_group : false);
 	bool		agg_star = (fn ? fn->agg_star : false);
 	bool		agg_distinct = (fn ? fn->agg_distinct : false);
 	bool		func_variadic = (fn ? fn->func_variadic : false);
-	WindowDef  *over = (fn ? fn->over : NULL);
+	CoercionForm funcformat = (fn ? fn->funcformat : COERCE_EXPLICIT_CALL);
 	bool		could_be_projection;
 	Oid			rettype;
 	Oid			funcid;
@@ -221,6 +222,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 						   agg_order == NIL && agg_filter == NULL &&
 						   !agg_star && !agg_distinct && over == NULL &&
 						   !func_variadic && argnames == NIL &&
+						   funcformat == COERCE_EXPLICIT_CALL &&
 						   list_length(funcname) == 1 &&
 						   (actual_arg_types[0] == RECORDOID ||
 							ISCOMPLEX(actual_arg_types[0])));
@@ -742,7 +744,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		funcexpr->funcresulttype = rettype;
 		funcexpr->funcretset = retset;
 		funcexpr->funcvariadic = func_variadic;
-		funcexpr->funcformat = COERCE_EXPLICIT_CALL;
+		funcexpr->funcformat = funcformat;
 		/* funccollid and inputcollid will be set by parse_collate.c */
 		funcexpr->args = fargs;
 		funcexpr->location = location;
@@ -767,6 +769,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggkind = aggkind;
 		/* agglevelsup will be set by transformAggregateCall */
 		aggref->aggsplit = AGGSPLIT_SIMPLE; /* planner might change this */
+		aggref->aggno = -1;		/* planner will set aggno and aggtransno */
+		aggref->aggtransno = -1;
 		aggref->location = location;
 
 		/*
@@ -1750,6 +1754,7 @@ unify_hypothetical_args(ParseState *pstate,
 		ListCell   *harg = list_nth_cell(fargs, hargpos);
 		ListCell   *aarg = list_nth_cell(fargs, aargpos);
 		Oid			commontype;
+		int32		commontypmod;
 
 		/* A mismatch means AggregateCreate didn't check properly ... */
 		if (declared_arg_types[hargpos] != declared_arg_types[aargpos])
@@ -1768,6 +1773,9 @@ unify_hypothetical_args(ParseState *pstate,
 										list_make2(lfirst(aarg), lfirst(harg)),
 										"WITHIN GROUP",
 										NULL);
+		commontypmod = select_common_typmod(pstate,
+											list_make2(lfirst(aarg), lfirst(harg)),
+											commontype);
 
 		/*
 		 * Perform the coercions.  We don't need to worry about NamedArgExprs
@@ -1776,7 +1784,7 @@ unify_hypothetical_args(ParseState *pstate,
 		lfirst(harg) = coerce_type(pstate,
 								   (Node *) lfirst(harg),
 								   actual_arg_types[hargpos],
-								   commontype, -1,
+								   commontype, commontypmod,
 								   COERCION_IMPLICIT,
 								   COERCE_IMPLICIT_CAST,
 								   -1);
@@ -1784,7 +1792,7 @@ unify_hypothetical_args(ParseState *pstate,
 		lfirst(aarg) = coerce_type(pstate,
 								   (Node *) lfirst(aarg),
 								   actual_arg_types[aargpos],
-								   commontype, -1,
+								   commontype, commontypmod,
 								   COERCION_IMPLICIT,
 								   COERCE_IMPLICIT_CAST,
 								   -1);
@@ -1913,13 +1921,15 @@ ParseComplexProjection(ParseState *pstate, const char *funcname, Node *first_arg
 	if (IsA(first_arg, Var) &&
 		((Var *) first_arg)->varattno == InvalidAttrNumber)
 	{
-		RangeTblEntry *rte;
+		ParseNamespaceItem *nsitem;
 
-		rte = GetRTEByRangeTablePosn(pstate,
-									 ((Var *) first_arg)->varno,
-									 ((Var *) first_arg)->varlevelsup);
+		nsitem = GetNSItemByRangeTablePosn(pstate,
+										   ((Var *) first_arg)->varno,
+										   ((Var *) first_arg)->varlevelsup);
 		/* Return a Var if funcname matches a column, else NULL */
-		return scanRTEForColumn(pstate, rte, funcname, location, 0, NULL);
+		return scanNSItemForColumn(pstate, nsitem,
+								   ((Var *) first_arg)->varlevelsup,
+								   funcname, location);
 	}
 
 	/*

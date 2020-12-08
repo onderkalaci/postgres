@@ -2707,6 +2707,7 @@ select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
 (5 rows)
 
 set enable_mergejoin = 0;
+set enable_hashjoin = 0;
 explain (costs off)
 select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
                      QUERY PLAN                     
@@ -3010,6 +3011,70 @@ order by 1,2;
 (8 rows)
 
 --
+-- variant where a PlaceHolderVar is needed at a join, but not above the join
+--
+explain (costs off)
+select * from
+  int4_tbl as i41,
+  lateral
+    (select 1 as x from
+      (select i41.f1 as lat,
+              i42.f1 as loc from
+         int8_tbl as i81, int4_tbl as i42) as ss1
+      right join int4_tbl as i43 on (i43.f1 > 1)
+      where ss1.loc = ss1.lat) as ss2
+where i41.f1 > 0;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Nested Loop
+   ->  Nested Loop
+         ->  Seq Scan on int4_tbl i41
+               Filter: (f1 > 0)
+         ->  Nested Loop
+               Join Filter: (i41.f1 = i42.f1)
+               ->  Seq Scan on int8_tbl i81
+               ->  Materialize
+                     ->  Seq Scan on int4_tbl i42
+   ->  Materialize
+         ->  Seq Scan on int4_tbl i43
+               Filter: (f1 > 1)
+(12 rows)
+
+select * from
+  int4_tbl as i41,
+  lateral
+    (select 1 as x from
+      (select i41.f1 as lat,
+              i42.f1 as loc from
+         int8_tbl as i81, int4_tbl as i42) as ss1
+      right join int4_tbl as i43 on (i43.f1 > 1)
+      where ss1.loc = ss1.lat) as ss2
+where i41.f1 > 0;
+     f1     | x 
+------------+---
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+     123456 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+ 2147483647 | 1
+(20 rows)
+
+--
 -- test the corner cases FULL JOIN ON TRUE and FULL JOIN ON FALSE
 --
 select * from int4_tbl a full join int4_tbl b on true;
@@ -3241,6 +3306,68 @@ where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
 ---------+----------+---------+----------
       11 | WFAAAA   |       3 | LKIAAA
 (1 row)
+
+-- Here's a variant that we can't fold too aggressively, though,
+-- or we end up with noplace to evaluate the lateral PHV
+explain (verbose, costs off)
+select * from
+  (select 1 as x) ss1 left join (select 2 as y) ss2 on (true),
+  lateral (select ss2.y as z limit 1) ss3;
+        QUERY PLAN         
+---------------------------
+ Nested Loop
+   Output: 1, (2), ((2))
+   ->  Result
+         Output: 2
+   ->  Limit
+         Output: ((2))
+         ->  Result
+               Output: (2)
+(8 rows)
+
+select * from
+  (select 1 as x) ss1 left join (select 2 as y) ss2 on (true),
+  lateral (select ss2.y as z limit 1) ss3;
+ x | y | z 
+---+---+---
+ 1 | 2 | 2
+(1 row)
+
+-- Test proper handling of appendrel PHVs during useless-RTE removal
+explain (costs off)
+select * from
+  (select 0 as z) as t1
+  left join
+  (select true as a) as t2
+  on true,
+  lateral (select true as b
+           union all
+           select a as b) as t3
+where b;
+              QUERY PLAN               
+---------------------------------------
+ Nested Loop
+   ->  Result
+   ->  Append
+         ->  Result
+         ->  Result
+               One-Time Filter: (true)
+(6 rows)
+
+select * from
+  (select 0 as z) as t1
+  left join
+  (select true as a) as t2
+  on true,
+  lateral (select true as b
+           union all
+           select a as b) as t3
+where b;
+ z | a | b 
+---+---+---
+ 0 | t | t
+ 0 | t | t
+(2 rows)
 
 --
 -- test inlining of immutable functions
@@ -5779,8 +5906,8 @@ select t1.b, ss.phv from join_ut1 t1 left join lateral
               (select t2.a as t2a, t3.a t3a, least(t1.a, t2.a, t3.a) phv
 					  from join_pt1 t2 join join_ut1 t3 on t2.a = t3.b) ss
               on t1.a = ss.t2a order by t1.a;
-                            QUERY PLAN                            
-------------------------------------------------------------------
+                             QUERY PLAN                             
+--------------------------------------------------------------------
  Sort
    Output: t1.b, (LEAST(t1.a, t2.a, t3.a)), t1.a
    Sort Key: t1.a
@@ -5796,12 +5923,12 @@ select t1.b, ss.phv from join_ut1 t1 left join lateral
                ->  Hash
                      Output: t2.a
                      ->  Append
-                           ->  Seq Scan on public.join_pt1p1p1 t2
-                                 Output: t2.a
-                                 Filter: (t1.a = t2.a)
-                           ->  Seq Scan on public.join_pt1p2 t2_1
+                           ->  Seq Scan on public.join_pt1p1p1 t2_1
                                  Output: t2_1.a
                                  Filter: (t1.a = t2_1.a)
+                           ->  Seq Scan on public.join_pt1p2 t2_2
+                                 Output: t2_2.a
+                                 Filter: (t1.a = t2_2.a)
 (21 rows)
 
 select t1.b, ss.phv from join_ut1 t1 left join lateral
@@ -5816,6 +5943,56 @@ select t1.b, ss.phv from join_ut1 t1 left join lateral
 
 drop table join_pt1;
 drop table join_ut1;
+--
+-- test estimation behavior with multi-column foreign key and constant qual
+--
+begin;
+create table fkest (x integer, x10 integer, x10b integer, x100 integer);
+insert into fkest select x, x/10, x/10, x/100 from generate_series(1,1000) x;
+create unique index on fkest(x, x10, x100);
+analyze fkest;
+explain (costs off)
+select * from fkest f1
+  join fkest f2 on (f1.x = f2.x and f1.x10 = f2.x10b and f1.x100 = f2.x100)
+  join fkest f3 on f1.x = f3.x
+  where f1.x100 = 2;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Nested Loop
+   ->  Hash Join
+         Hash Cond: ((f2.x = f1.x) AND (f2.x10b = f1.x10))
+         ->  Seq Scan on fkest f2
+               Filter: (x100 = 2)
+         ->  Hash
+               ->  Seq Scan on fkest f1
+                     Filter: (x100 = 2)
+   ->  Index Scan using fkest_x_x10_x100_idx on fkest f3
+         Index Cond: (x = f1.x)
+(10 rows)
+
+alter table fkest add constraint fk
+  foreign key (x, x10b, x100) references fkest (x, x10, x100);
+explain (costs off)
+select * from fkest f1
+  join fkest f2 on (f1.x = f2.x and f1.x10 = f2.x10b and f1.x100 = f2.x100)
+  join fkest f3 on f1.x = f3.x
+  where f1.x100 = 2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Hash Join
+   Hash Cond: ((f2.x = f1.x) AND (f2.x10b = f1.x10))
+   ->  Hash Join
+         Hash Cond: (f3.x = f2.x)
+         ->  Seq Scan on fkest f3
+         ->  Hash
+               ->  Seq Scan on fkest f2
+                     Filter: (x100 = 2)
+   ->  Hash
+         ->  Seq Scan on fkest f1
+               Filter: (x100 = 2)
+(11 rows)
+
+rollback;
 --
 -- test that foreign key join estimation performs sanely for outer joins
 --
@@ -6144,6 +6321,53 @@ where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1;
 select * from j1
 inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
 where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1;
+ id1 | id2 | id1 | id2 
+-----+-----+-----+-----
+   1 |   1 |   1 |   1
+   1 |   2 |   1 |   2
+(2 rows)
+
+-- Exercise array keys mark/restore B-Tree code
+explain (costs off) select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 = any (array[1]);
+                     QUERY PLAN                     
+----------------------------------------------------
+ Merge Join
+   Merge Cond: (j1.id1 = j2.id1)
+   Join Filter: (j1.id2 = j2.id2)
+   ->  Index Scan using j1_id1_idx on j1
+   ->  Index Scan using j2_id1_idx on j2
+         Index Cond: (id1 = ANY ('{1}'::integer[]))
+(6 rows)
+
+select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 = any (array[1]);
+ id1 | id2 | id1 | id2 
+-----+-----+-----+-----
+   1 |   1 |   1 |   1
+   1 |   2 |   1 |   2
+(2 rows)
+
+-- Exercise array keys "find extreme element" B-Tree code
+explain (costs off) select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 >= any (array[1,5]);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Merge Join
+   Merge Cond: (j1.id1 = j2.id1)
+   Join Filter: (j1.id2 = j2.id2)
+   ->  Index Scan using j1_id1_idx on j1
+   ->  Index Only Scan using j2_pkey on j2
+         Index Cond: (id1 >= ANY ('{1,5}'::integer[]))
+         Filter: ((id1 % 1000) = 1)
+(7 rows)
+
+select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 >= any (array[1,5]);
  id1 | id2 | id1 | id2 
 -----+-----+-----+-----
    1 |   1 |   1 |   1

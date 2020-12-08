@@ -9,7 +9,7 @@
  * bootstrap file from these header files.)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/genbki.h
@@ -41,13 +41,43 @@
  */
 #define BKI_LOOKUP(catalog)
 
+/*
+ * These lines are processed by genbki.pl to create the statements
+ * the bootstrap parser will turn into BootstrapToastTable commands.
+ * Each line specifies the system catalog that needs a toast table,
+ * the OID to assign to the toast table, and the OID to assign to the
+ * toast table's index.  The reason we hard-wire these OIDs is that we
+ * need stable OIDs for shared relations, and that includes toast tables
+ * of shared relations.
+ *
+ * The macro definition is just to keep the C compiler from spitting up.
+ */
+#define DECLARE_TOAST(name,toastoid,indexoid) extern int no_such_variable
+
+/*
+ * These lines processed by genbki.pl to create the statements
+ * the bootstrap parser will turn into DefineIndex calls.
+ *
+ * The keyword is DECLARE_INDEX or DECLARE_UNIQUE_INDEX.  The first two
+ * arguments are the index name and OID, the rest is much like a standard
+ * 'create index' SQL command.
+ *
+ * For each index, we also provide a #define for its OID.  References to
+ * the index in the C code should always use these #defines, not the actual
+ * index name (much less the numeric OID).
+ *
+ * The macro definitions are just to keep the C compiler from spitting up.
+ */
+#define DECLARE_INDEX(name,oid,decl) extern int no_such_variable
+#define DECLARE_UNIQUE_INDEX(name,oid,decl) extern int no_such_variable
+
 /* The following are never defined; they are here only for documentation. */
 
 /*
  * Variable-length catalog fields (except possibly the first not nullable one)
  * should not be visible in C structures, so they are made invisible by #ifdefs
- * of an undefined symbol.  See also MARKNOTNULL in bootstrap.c for how this is
- * handled.
+ * of an undefined symbol.  See also the BOOTCOL_NULL_AUTO code in bootstrap.c
+ * for how this is handled.
  */
 #undef CATALOG_VARLEN
 

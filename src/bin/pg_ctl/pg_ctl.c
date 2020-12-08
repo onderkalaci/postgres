@@ -2,7 +2,7 @@
  *
  * pg_ctl --- start/stops/restarts the PostgreSQL server
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  *
  * src/bin/pg_ctl/pg_ctl.c
  *
@@ -422,8 +422,6 @@ free_readfile(char **optlines)
 		free(curr_line);
 
 	free(optlines);
-
-	return;
 }
 
 /*
@@ -521,8 +519,43 @@ start_postmaster(void)
 		comspec = "CMD";
 
 	if (log_file != NULL)
+	{
+		/*
+		 * First, open the log file if it exists.  The idea is that if the
+		 * file is still locked by a previous postmaster run, we'll wait until
+		 * it comes free, instead of failing with ERROR_SHARING_VIOLATION.
+		 * (It'd be better to open the file in a sharing-friendly mode, but we
+		 * can't use CMD.EXE to do that, so work around it.  Note that the
+		 * previous postmaster will still have the file open for a short time
+		 * after removing postmaster.pid.)
+		 *
+		 * If the log file doesn't exist, we *must not* create it here.  If we
+		 * were launched with higher privileges than the restricted process
+		 * will have, the log file might end up with permissions settings that
+		 * prevent the postmaster from writing on it.
+		 */
+		int			fd = open(log_file, O_RDWR, 0);
+
+		if (fd == -1)
+		{
+			/*
+			 * ENOENT is expectable since we didn't use O_CREAT.  Otherwise
+			 * complain.  We could just fall through and let CMD.EXE report
+			 * the problem, but its error reporting is pretty miserable.
+			 */
+			if (errno != ENOENT)
+			{
+				write_stderr(_("%s: could not open log file \"%s\": %s\n"),
+							 progname, log_file, strerror(errno));
+				exit(1);
+			}
+		}
+		else
+			close(fd);
+
 		snprintf(cmd, MAXPGPATH, "\"%s\" /C \"\"%s\" %s%s < \"%s\" >> \"%s\" 2>&1\"",
 				 comspec, exec_path, pgdata_opt, post_opts, DEVNULL, log_file);
+	}
 	else
 		snprintf(cmd, MAXPGPATH, "\"%s\" /C \"\"%s\" %s%s < \"%s\" 2>&1\"",
 				 comspec, exec_path, pgdata_opt, post_opts, DEVNULL);
@@ -777,8 +810,7 @@ find_other_exec_or_die(const char *argv0, const char *target, const char *versio
 			strlcpy(full_path, progname, sizeof(full_path));
 
 		if (ret == -1)
-			write_stderr(_("The program \"%s\" is needed by %s "
-						   "but was not found in the\n"
+			write_stderr(_("The program \"%s\" is needed by %s but was not found in the\n"
 						   "same directory as \"%s\".\n"
 						   "Check your installation.\n"),
 						 target, progname, full_path);
@@ -1163,11 +1195,6 @@ do_promote(void)
 		exit(1);
 	}
 
-	/*
-	 * For 9.3 onwards, "fast" promotion is performed. Promotion with a full
-	 * checkpoint is still possible by writing a file called
-	 * "fallback_promote" instead of "promote"
-	 */
 	snprintf(promote_file, MAXPGPATH, "%s/promote", pg_data);
 
 	if ((prmfile = fopen(promote_file, "w")) == NULL)
@@ -1751,7 +1778,7 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 	Advapi32Handle = LoadLibrary("ADVAPI32.DLL");
 	if (Advapi32Handle != NULL)
 	{
-		_CreateRestrictedToken = (__CreateRestrictedToken) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
+		_CreateRestrictedToken = (__CreateRestrictedToken) (pg_funcptr_t) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
 	}
 
 	if (_CreateRestrictedToken == NULL)
@@ -1825,11 +1852,11 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 	Kernel32Handle = LoadLibrary("KERNEL32.DLL");
 	if (Kernel32Handle != NULL)
 	{
-		_IsProcessInJob = (__IsProcessInJob) GetProcAddress(Kernel32Handle, "IsProcessInJob");
-		_CreateJobObject = (__CreateJobObject) GetProcAddress(Kernel32Handle, "CreateJobObjectA");
-		_SetInformationJobObject = (__SetInformationJobObject) GetProcAddress(Kernel32Handle, "SetInformationJobObject");
-		_AssignProcessToJobObject = (__AssignProcessToJobObject) GetProcAddress(Kernel32Handle, "AssignProcessToJobObject");
-		_QueryInformationJobObject = (__QueryInformationJobObject) GetProcAddress(Kernel32Handle, "QueryInformationJobObject");
+		_IsProcessInJob = (__IsProcessInJob) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "IsProcessInJob");
+		_CreateJobObject = (__CreateJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "CreateJobObjectA");
+		_SetInformationJobObject = (__SetInformationJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "SetInformationJobObject");
+		_AssignProcessToJobObject = (__AssignProcessToJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "AssignProcessToJobObject");
+		_QueryInformationJobObject = (__QueryInformationJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "QueryInformationJobObject");
 	}
 
 	/* Verify that we found all functions */
@@ -2062,7 +2089,8 @@ do_help(void)
 	printf(_("  demand     start service on demand\n"));
 #endif
 
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
 

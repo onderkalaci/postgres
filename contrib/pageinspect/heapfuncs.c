@@ -15,7 +15,7 @@
  * there's hardly any use case for using these without superuser-rights
  * anyway.
  *
- * Copyright (c) 2007-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pageinspect/heapfuncs.c
@@ -30,6 +30,7 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
 #include "port/pg_bitutils.h"
@@ -99,7 +100,8 @@ text_to_bits(char *str, int len)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("illegal character '%c' in t_bits string", str[off])));
+					 errmsg("invalid character \"%.*s\" in t_bits string",
+							pg_mblen(str + off), str + off)));
 
 		if (off % 8 == 7)
 			bits[off / 8] = byte;
@@ -135,7 +137,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("must be superuser to use raw page functions"))));
+				 errmsg("must be superuser to use raw page functions")));
 
 	raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
 
@@ -250,8 +252,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 
 					bits_len =
 						BITMAPLEN(HeapTupleHeaderGetNatts(tuphdr)) * BITS_PER_BYTE;
-					values[11] = CStringGetTextDatum(
-													 bits_to_text(tuphdr->t_bits, bits_len));
+					values[11] = CStringGetTextDatum(bits_to_text(tuphdr->t_bits, bits_len));
 				}
 				else
 					nulls[11] = true;
@@ -461,14 +462,13 @@ tuple_data_split(PG_FUNCTION_ARGS)
 		if (!t_bits_str)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("argument of t_bits is null, but it is expected to be null and %d character long",
-							bits_len)));
+					 errmsg("t_bits string must not be NULL")));
 
 		bits_str_len = strlen(t_bits_str);
 		if (bits_len != bits_str_len)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("unexpected length of t_bits %u, expected %d",
+					 errmsg("unexpected length of t_bits string: %u, expected %u",
 							bits_str_len, bits_len)));
 
 		/* do the conversion */
@@ -479,7 +479,7 @@ tuple_data_split(PG_FUNCTION_ARGS)
 		if (t_bits_str)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("t_bits string is expected to be NULL, but instead it is %zu bytes length",
+					 errmsg("t_bits string is expected to be NULL, but instead it is %zu bytes long",
 							strlen(t_bits_str))));
 	}
 
@@ -590,7 +590,7 @@ heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 
 	/* build value */
 	Assert(cnt <= bitcnt);
-	a = construct_array(flags, cnt, TEXTOID, -1, false, 'i');
+	a = construct_array(flags, cnt, TEXTOID, -1, false, TYPALIGN_INT);
 	values[0] = PointerGetDatum(a);
 
 	/*
@@ -612,7 +612,7 @@ heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 	if (cnt == 0)
 		a = construct_empty_array(TEXTOID);
 	else
-		a = construct_array(flags, cnt, TEXTOID, -1, false, 'i');
+		a = construct_array(flags, cnt, TEXTOID, -1, false, TYPALIGN_INT);
 	pfree(flags);
 	values[1] = PointerGetDatum(a);
 

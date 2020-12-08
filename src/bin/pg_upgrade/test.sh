@@ -6,7 +6,7 @@
 # runs the regression tests (to put in some data), runs pg_dumpall,
 # runs pg_upgrade, runs pg_dumpall again, compares the dumps.
 #
-# Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 
 set -e
@@ -39,14 +39,14 @@ testhost=`uname -s | sed 's/^MSYS/MINGW/'`
 case $testhost in
 	MINGW*)
 		LISTEN_ADDRESSES="localhost"
+		PG_REGRESS_SOCKET_DIR=""
 		PGHOST=localhost
 		;;
 	*)
 		LISTEN_ADDRESSES=""
 		# Select a socket directory.  The algorithm is from the "configure"
 		# script; the outcome mimics pg_regress.c:make_temp_sockdir().
-		PGHOST=$PG_REGRESS_SOCK_DIR
-		if [ "x$PGHOST" = x ]; then
+		if [ x"$PG_REGRESS_SOCKET_DIR" = x ]; then
 			set +e
 			dir=`(umask 077 &&
 				  mktemp -d /tmp/pg_upgrade_check-XXXXXX) 2>/dev/null`
@@ -59,14 +59,15 @@ case $testhost in
 				fi
 			fi
 			set -e
-			PGHOST=$dir
-			trap 'rm -rf "$PGHOST"' 0
+			PG_REGRESS_SOCKET_DIR=$dir
+			trap 'rm -rf "$PG_REGRESS_SOCKET_DIR"' 0
 			trap 'exit 3' 1 2 13 15
 		fi
+		PGHOST=$PG_REGRESS_SOCKET_DIR
 		;;
 esac
 
-POSTMASTER_OPTS="-F -c listen_addresses=\"$LISTEN_ADDRESSES\" -k \"$PGHOST\""
+POSTMASTER_OPTS="-F -c listen_addresses=\"$LISTEN_ADDRESSES\" -k \"$PG_REGRESS_SOCKET_DIR\""
 export PGHOST
 
 # don't rely on $PWD here, as old shells don't set it
@@ -105,8 +106,6 @@ outputdir="$temp_root/regress"
 EXTRA_REGRESS_OPTS="$EXTRA_REGRESS_OPTS --outputdir=$outputdir"
 export EXTRA_REGRESS_OPTS
 mkdir "$outputdir"
-mkdir "$outputdir"/sql
-mkdir "$outputdir"/expected
 mkdir "$outputdir"/testtablespace
 
 logdir=`pwd`/log
@@ -243,14 +242,6 @@ case $testhost in
 esac
 
 pg_ctl start -l "$logdir/postmaster2.log" -o "$POSTMASTER_OPTS" -w
-
-# In the commands below we inhibit msys2 from converting the "/c" switch
-# in "cmd /c" to a file system path.
-
-case $testhost in
-	MINGW*)	MSYS2_ARG_CONV_EXCL=/c cmd /c analyze_new_cluster.bat ;;
-	*)		sh ./analyze_new_cluster.sh ;;
-esac
 
 pg_dumpall --no-sync -f "$temp_root"/dump2.sql || pg_dumpall2_status=$?
 pg_ctl -m fast stop

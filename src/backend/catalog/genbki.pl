@@ -1,13 +1,12 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 #----------------------------------------------------------------------
 #
 # genbki.pl
-#    Perl script that generates postgres.bki, postgres.description,
-#    postgres.shdescription, and symbol definition headers from specially
-#    formatted header files and data files.  The BKI files are used to
-#    initialize the postgres template database.
+#    Perl script that generates postgres.bki and symbol definition
+#    headers from specially formatted header files and data files.
+#    postgres.bki is used to initialize the postgres template database.
 #
-# Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/catalog/genbki.pl
@@ -18,9 +17,8 @@ use strict;
 use warnings;
 use Getopt::Long;
 
-use File::Basename;
-use File::Spec;
-BEGIN { use lib File::Spec->rel2abs(dirname(__FILE__)); }
+use FindBin;
+use lib $FindBin::RealBin;
 
 use Catalog;
 
@@ -93,9 +91,29 @@ foreach my $header (@ARGV)
 		my $data = Catalog::ParseData($datfile, $schema, 0);
 		$catalog_data{$catname} = $data;
 
-		# Check for duplicated OIDs while we're at it.
 		foreach my $row (@$data)
 		{
+			# Generate entries for pg_description and pg_shdescription.
+			if (defined $row->{descr})
+			{
+				my %descr = (
+					objoid      => $row->{oid},
+					classoid    => $catalog->{relation_oid},
+					objsubid    => 0,
+					description => $row->{descr});
+
+				if ($catalog->{shared_relation})
+				{
+					delete $descr{objsubid};
+					push @{ $catalog_data{pg_shdescription} }, \%descr;
+				}
+				else
+				{
+					push @{ $catalog_data{pg_description} }, \%descr;
+				}
+			}
+
+			# Check for duplicated OIDs while we're at it.
 			$oidcounts{ $row->{oid} }++ if defined $row->{oid};
 		}
 	}
@@ -163,6 +181,15 @@ my $C_COLLATION_OID =
 my $PG_CATALOG_NAMESPACE =
   Catalog::FindDefinedSymbolFromData($catalog_data{pg_namespace},
 	'PG_CATALOG_NAMESPACE');
+
+
+# Fill in pg_class.relnatts by looking at the referenced catalog's schema.
+# This is ugly but there's no better place; Catalog::AddDefaultValues
+# can't do it, for lack of easy access to the other catalog.
+foreach my $row (@{ $catalog_data{pg_class} })
+{
+	$row->{relnatts} = scalar(@{ $catalogs{ $row->{relname} }->{columns} });
+}
 
 
 # Build lookup tables.
@@ -361,15 +388,8 @@ open my $bki, '>', $bkifile . $tmpext
 my $schemafile = $output_path . 'schemapg.h';
 open my $schemapg, '>', $schemafile . $tmpext
   or die "can't open $schemafile$tmpext: $!";
-my $descrfile = $output_path . 'postgres.description';
-open my $descr, '>', $descrfile . $tmpext
-  or die "can't open $descrfile$tmpext: $!";
-my $shdescrfile = $output_path . 'postgres.shdescription';
-open my $shdescr, '>', $shdescrfile . $tmpext
-  or die "can't open $shdescrfile$tmpext: $!";
 
-# Generate postgres.bki, postgres.description, postgres.shdescription,
-# and pg_*_d.h headers.
+# Generate postgres.bki and pg_*_d.h headers.
 
 # version marker for .bki file
 print $bki "# PostgreSQL $major_version\n";
@@ -395,7 +415,7 @@ foreach my $catname (@catnames)
  * %s_d.h
  *    Macro definitions for %s
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -568,9 +588,13 @@ EOM
 		}
 
 		# Special hack to generate OID symbols for pg_type entries
-		# that lack one.
-		if ($catname eq 'pg_type' and !exists $bki_values{oid_symbol})
+		if ($catname eq 'pg_type')
 		{
+			die sprintf
+			  "custom OID symbols are not allowed for pg_type entries: '%s'",
+			  $bki_values{oid_symbol}
+			  if defined $bki_values{oid_symbol};
+
 			my $symbol = form_pg_type_symbol($bki_values{typname});
 			$bki_values{oid_symbol} = $symbol
 			  if defined $symbol;
@@ -579,25 +603,16 @@ EOM
 		# Write to postgres.bki
 		print_bki_insert(\%bki_values, $schema);
 
-		# Write comments to postgres.description and
-		# postgres.shdescription
-		if (defined $bki_values{descr})
-		{
-			if ($catalog->{shared_relation})
-			{
-				printf $shdescr "%s\t%s\t%s\n",
-				  $bki_values{oid}, $catname, $bki_values{descr};
-			}
-			else
-			{
-				printf $descr "%s\t%s\t0\t%s\n",
-				  $bki_values{oid}, $catname, $bki_values{descr};
-			}
-		}
-
 		# Emit OID symbol
 		if (defined $bki_values{oid_symbol})
 		{
+			# OID symbols for builtin functions are handled automatically
+			# by utils/Gen_fmgrtab.pl
+			die sprintf
+			  "custom OID symbols are not allowed for pg_proc entries: '%s'",
+			  $bki_values{oid_symbol}
+			  if $catname eq 'pg_proc';
+
 			printf $def "#define %s %s\n",
 			  $bki_values{oid_symbol}, $bki_values{oid};
 		}
@@ -643,7 +658,7 @@ print $schemapg <<EOM;
  * schemapg.h
  *    Schema_pg_xxx macros for use by relcache.c
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -673,14 +688,10 @@ print $schemapg "\n#endif\t\t\t\t\t\t\t/* SCHEMAPG_H */\n";
 # We're done emitting data
 close $bki;
 close $schemapg;
-close $descr;
-close $shdescr;
 
 # Finally, rename the completed files into place.
-Catalog::RenameTempFile($bkifile,     $tmpext);
-Catalog::RenameTempFile($schemafile,  $tmpext);
-Catalog::RenameTempFile($descrfile,   $tmpext);
-Catalog::RenameTempFile($shdescrfile, $tmpext);
+Catalog::RenameTempFile($bkifile,    $tmpext);
+Catalog::RenameTempFile($schemafile, $tmpext);
 
 exit 0;
 
@@ -713,8 +724,8 @@ sub gen_pg_attribute
 		push @tables_needing_macros, $table_name;
 
 		# Generate entries for user attributes.
-		my $attnum       = 0;
-		my $priornotnull = 1;
+		my $attnum          = 0;
+		my $priorfixedwidth = 1;
 		foreach my $attr (@{ $table->{columns} })
 		{
 			$attnum++;
@@ -722,8 +733,12 @@ sub gen_pg_attribute
 			$row{attnum}   = $attnum;
 			$row{attrelid} = $table->{relation_oid};
 
-			morph_row_for_pgattr(\%row, $schema, $attr, $priornotnull);
-			$priornotnull &= ($row{attnotnull} eq 't');
+			morph_row_for_pgattr(\%row, $schema, $attr, $priorfixedwidth);
+
+			# Update $priorfixedwidth --- must match morph_row_for_pgattr
+			$priorfixedwidth &=
+			  ($row{attnotnull} eq 't'
+				  && ($row{attlen} eq 'NAMEDATALEN' || $row{attlen} > 0));
 
 			# If it's bootstrapped, put an entry in postgres.bki.
 			print_bki_insert(\%row, $schema) if $table->{bootstrap};
@@ -765,13 +780,13 @@ sub gen_pg_attribute
 
 # Given $pgattr_schema (the pg_attribute schema for a catalog sufficient for
 # AddDefaultValues), $attr (the description of a catalog row), and
-# $priornotnull (whether all prior attributes in this catalog are not null),
+# $priorfixedwidth (all prior columns are fixed-width and not null),
 # modify the $row hashref for print_bki_insert.  This includes setting data
 # from the corresponding pg_type element and filling in any default values.
 # Any value not handled here must be supplied by caller.
 sub morph_row_for_pgattr
 {
-	my ($row, $pgattr_schema, $attr, $priornotnull) = @_;
+	my ($row, $pgattr_schema, $attr, $priorfixedwidth) = @_;
 	my $attname = $attr->{name};
 	my $atttype = $attr->{type};
 
@@ -801,19 +816,18 @@ sub morph_row_for_pgattr
 	{
 		$row->{attnotnull} = 'f';
 	}
-	elsif ($priornotnull)
+	elsif ($priorfixedwidth)
 	{
 
 		# attnotnull will automatically be set if the type is
-		# fixed-width and prior columns are all NOT NULL ---
-		# compare DefineAttr in bootstrap.c. oidvector and
-		# int2vector are also treated as not-nullable.
+		# fixed-width and prior columns are likewise fixed-width
+		# and NOT NULL --- compare DefineAttr in bootstrap.c.
+		# At this point the width of type name is still symbolic,
+		# so we need a special test.
 		$row->{attnotnull} =
-		    $type->{typname} eq 'oidvector'  ? 't'
-		  : $type->{typname} eq 'int2vector' ? 't'
-		  : $type->{typlen} eq 'NAMEDATALEN' ? 't'
-		  : $type->{typlen} > 0              ? 't'
-		  :                                    'f';
+		    $row->{attlen} eq 'NAMEDATALEN' ? 't'
+		  : $row->{attlen} > 0              ? 't'
+		  :                                   'f';
 	}
 	else
 	{
@@ -842,17 +856,15 @@ sub print_bki_insert
 		# since that represents a NUL char in C code.
 		$bki_value = '' if $bki_value eq '\0';
 
-		# Handle single quotes by doubling them, and double quotes by
-		# converting them to octal escapes, because that's what the
+		# Handle single quotes by doubling them, because that's what the
 		# bootstrap scanner requires.  We do not process backslashes
 		# specially; this allows escape-string-style backslash escapes
 		# to be used in catalog data.
 		$bki_value =~ s/'/''/g;
-		$bki_value =~ s/"/\\042/g;
 
 		# Quote value if needed.  We need not quote values that satisfy
 		# the "id" pattern in bootscanner.l, currently "[-A-Za-z0-9_]+".
-		$bki_value = sprintf(qq'"%s"', $bki_value)
+		$bki_value = sprintf("'%s'", $bki_value)
 		  if length($bki_value) == 0
 		  or $bki_value =~ /[^-A-Za-z0-9_]/;
 
@@ -967,9 +979,9 @@ Options:
     --set-version    PostgreSQL version number for initdb cross-check
     --include-path   Include path in source tree
 
-genbki.pl generates BKI files and symbol definition
+genbki.pl generates postgres.bki and symbol definition
 headers from specially formatted header files and .dat
-files.  The BKI files are used to initialize the
+files.  postgres.bki is used to initialize the
 postgres template database.
 
 Report bugs to <pgsql-bugs\@lists.postgresql.org>.

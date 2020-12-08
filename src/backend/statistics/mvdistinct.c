@@ -13,7 +13,7 @@
  * estimates are already available in pg_statistic.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -576,15 +576,7 @@ n_choose_k(int n, int k)
 static int
 num_combinations(int n)
 {
-	int			k;
-	int			ncombs = 1;
-
-	for (k = 1; k <= n; k++)
-		ncombs *= 2;
-
-	ncombs -= (n + 1);
-
-	return ncombs;
+	return (1 << n) - (n + 1);
 }
 
 /*

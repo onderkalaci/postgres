@@ -7,8 +7,10 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = \
 		  brin \
 		  commit_ts \
+		  delay_execution \
 		  dummy_index_am \
 		  dummy_seclabel \
+		  plsample \
 		  snapshot_too_old \
 		  test_bloomfilter \
 		  test_ddl_deparse \
@@ -25,4 +27,11 @@ SUBDIRS = \
 		  unsafe_tests \
 		  worker_spi
 
+ifeq ($(with_openssl),yes)
+SUBDIRS += ssl_passphrase_callback
+else
+ALWAYS_SUBDIRS += ssl_passphrase_callback
+endif
+
 $(recurse)
+$(recurse_always)

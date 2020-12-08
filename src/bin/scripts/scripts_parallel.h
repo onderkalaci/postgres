@@ -3,7 +3,7 @@
  *	scripts_parallel.h
  *		Parallel support for bin/scripts/
  *
- *	Copyright (c) 2003-2019, PostgreSQL Global Development Group
+ *	Copyright (c) 2003-2020, PostgreSQL Global Development Group
  *
  *	src/bin/scripts/scripts_parallel.h
  *
@@ -12,6 +12,7 @@
 #ifndef SCRIPTS_PARALLEL_H
 #define SCRIPTS_PARALLEL_H
 
+#include "common.h"
 #include "libpq-fe.h"
 
 
@@ -23,10 +24,7 @@ typedef struct ParallelSlot
 
 extern ParallelSlot *ParallelSlotsGetIdle(ParallelSlot *slots, int numslots);
 
-extern ParallelSlot *ParallelSlotsSetup(const char *dbname, const char *host,
-										const char *port,
-										const char *username,
-										bool prompt_password,
+extern ParallelSlot *ParallelSlotsSetup(const ConnParams *cparams,
 										const char *progname, bool echo,
 										PGconn *conn, int numslots);
 

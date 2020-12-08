@@ -5,7 +5,7 @@
  *	  (pg_ts_config)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_ts_config.h
@@ -46,5 +46,10 @@ CATALOG(pg_ts_config,3602,TSConfigRelationId)
 } FormData_pg_ts_config;
 
 typedef FormData_pg_ts_config *Form_pg_ts_config;
+
+DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608, on pg_ts_config using btree(cfgname name_ops, cfgnamespace oid_ops));
+#define TSConfigNameNspIndexId	3608
+DECLARE_UNIQUE_INDEX(pg_ts_config_oid_index, 3712, on pg_ts_config using btree(oid oid_ops));
+#define TSConfigOidIndexId	3712
 
 #endif							/* PG_TS_CONFIG_H */

@@ -3,7 +3,7 @@
  * parse_expr.c
  *	  handle expressions in parser
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -57,7 +57,7 @@ bool		Transform_null_equals = false;
 #define PREC_GROUP_NOT_LIKE		9	/* NOT LIKE/ILIKE/SIMILAR */
 #define PREC_GROUP_NOT_BETWEEN	10	/* NOT BETWEEN */
 #define PREC_GROUP_NOT_IN		11	/* NOT IN */
-#define PREC_GROUP_POSTFIX_OP	12	/* generic postfix operators */
+#define PREC_GROUP_ANY_ALL		12	/* ANY/ALL */
 #define PREC_GROUP_INFIX_OP		13	/* generic infix operators */
 #define PREC_GROUP_PREFIX_OP	14	/* generic prefix operators */
 
@@ -71,7 +71,7 @@ bool		Transform_null_equals = false;
  * 4. LIKE ILIKE SIMILAR
  * 5. BETWEEN
  * 6. IN
- * 7. generic postfix Op
+ * 7. ANY ALL
  * 8. generic Op, including <= => <>
  * 9. generic prefix Op
  * 10. IS tests (NullTest, BooleanTest, etc)
@@ -94,7 +94,6 @@ static Node *transformAExprOpAny(ParseState *pstate, A_Expr *a);
 static Node *transformAExprOpAll(ParseState *pstate, A_Expr *a);
 static Node *transformAExprDistinct(ParseState *pstate, A_Expr *a);
 static Node *transformAExprNullIf(ParseState *pstate, A_Expr *a);
-static Node *transformAExprOf(ParseState *pstate, A_Expr *a);
 static Node *transformAExprIn(ParseState *pstate, A_Expr *a);
 static Node *transformAExprBetween(ParseState *pstate, A_Expr *a);
 static Node *transformBoolExpr(ParseState *pstate, BoolExpr *a);
@@ -114,8 +113,9 @@ static Node *transformXmlSerialize(ParseState *pstate, XmlSerialize *xs);
 static Node *transformBooleanTest(ParseState *pstate, BooleanTest *b);
 static Node *transformCurrentOfExpr(ParseState *pstate, CurrentOfExpr *cexpr);
 static Node *transformColumnRef(ParseState *pstate, ColumnRef *cref);
-static Node *transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte,
-								  int location);
+static Node *transformWholeRowRef(ParseState *pstate,
+								  ParseNamespaceItem *nsitem,
+								  int sublevels_up, int location);
 static Node *transformIndirection(ParseState *pstate, A_Indirection *ind);
 static Node *transformTypeCast(ParseState *pstate, TypeCast *tc);
 static Node *transformCollateClause(ParseState *pstate, CollateClause *c);
@@ -226,9 +226,6 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 						break;
 					case AEXPR_NULLIF:
 						result = transformAExprNullIf(pstate, a);
-						break;
-					case AEXPR_OF:
-						result = transformAExprOf(pstate, a);
 						break;
 					case AEXPR_IN:
 						result = transformAExprIn(pstate, a);
@@ -510,7 +507,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 	char	   *nspname = NULL;
 	char	   *relname = NULL;
 	char	   *colname = NULL;
-	RangeTblEntry *rte;
+	ParseNamespaceItem *nsitem;
 	int			levels_up;
 	enum
 	{
@@ -653,11 +650,11 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 					 * PostQUEL-inspired syntax.  The preferred form now is
 					 * "rel.*".
 					 */
-					rte = refnameRangeTblEntry(pstate, NULL, colname,
-											   cref->location,
-											   &levels_up);
-					if (rte)
-						node = transformWholeRowRef(pstate, rte,
+					nsitem = refnameNamespaceItem(pstate, NULL, colname,
+												  cref->location,
+												  &levels_up);
+					if (nsitem)
+						node = transformWholeRowRef(pstate, nsitem, levels_up,
 													cref->location);
 				}
 				break;
@@ -670,11 +667,11 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 				Assert(IsA(field1, String));
 				relname = strVal(field1);
 
-				/* Locate the referenced RTE */
-				rte = refnameRangeTblEntry(pstate, nspname, relname,
-										   cref->location,
-										   &levels_up);
-				if (rte == NULL)
+				/* Locate the referenced nsitem */
+				nsitem = refnameNamespaceItem(pstate, nspname, relname,
+											  cref->location,
+											  &levels_up);
+				if (nsitem == NULL)
 				{
 					crerr = CRERR_NO_RTE;
 					break;
@@ -683,20 +680,22 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 				/* Whole-row reference? */
 				if (IsA(field2, A_Star))
 				{
-					node = transformWholeRowRef(pstate, rte, cref->location);
+					node = transformWholeRowRef(pstate, nsitem, levels_up,
+												cref->location);
 					break;
 				}
 
 				Assert(IsA(field2, String));
 				colname = strVal(field2);
 
-				/* Try to identify as a column of the RTE */
-				node = scanRTEForColumn(pstate, rte, colname, cref->location,
-										0, NULL);
+				/* Try to identify as a column of the nsitem */
+				node = scanNSItemForColumn(pstate, nsitem, levels_up, colname,
+										   cref->location);
 				if (node == NULL)
 				{
 					/* Try it as a function call on the whole row */
-					node = transformWholeRowRef(pstate, rte, cref->location);
+					node = transformWholeRowRef(pstate, nsitem, levels_up,
+												cref->location);
 					node = ParseFuncOrColumn(pstate,
 											 list_make1(makeString(colname)),
 											 list_make1(node),
@@ -718,11 +717,11 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 				Assert(IsA(field2, String));
 				relname = strVal(field2);
 
-				/* Locate the referenced RTE */
-				rte = refnameRangeTblEntry(pstate, nspname, relname,
-										   cref->location,
-										   &levels_up);
-				if (rte == NULL)
+				/* Locate the referenced nsitem */
+				nsitem = refnameNamespaceItem(pstate, nspname, relname,
+											  cref->location,
+											  &levels_up);
+				if (nsitem == NULL)
 				{
 					crerr = CRERR_NO_RTE;
 					break;
@@ -731,20 +730,22 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 				/* Whole-row reference? */
 				if (IsA(field3, A_Star))
 				{
-					node = transformWholeRowRef(pstate, rte, cref->location);
+					node = transformWholeRowRef(pstate, nsitem, levels_up,
+												cref->location);
 					break;
 				}
 
 				Assert(IsA(field3, String));
 				colname = strVal(field3);
 
-				/* Try to identify as a column of the RTE */
-				node = scanRTEForColumn(pstate, rte, colname, cref->location,
-										0, NULL);
+				/* Try to identify as a column of the nsitem */
+				node = scanNSItemForColumn(pstate, nsitem, levels_up, colname,
+										   cref->location);
 				if (node == NULL)
 				{
 					/* Try it as a function call on the whole row */
-					node = transformWholeRowRef(pstate, rte, cref->location);
+					node = transformWholeRowRef(pstate, nsitem, levels_up,
+												cref->location);
 					node = ParseFuncOrColumn(pstate,
 											 list_make1(makeString(colname)),
 											 list_make1(node),
@@ -779,11 +780,11 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 					break;
 				}
 
-				/* Locate the referenced RTE */
-				rte = refnameRangeTblEntry(pstate, nspname, relname,
-										   cref->location,
-										   &levels_up);
-				if (rte == NULL)
+				/* Locate the referenced nsitem */
+				nsitem = refnameNamespaceItem(pstate, nspname, relname,
+											  cref->location,
+											  &levels_up);
+				if (nsitem == NULL)
 				{
 					crerr = CRERR_NO_RTE;
 					break;
@@ -792,20 +793,22 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 				/* Whole-row reference? */
 				if (IsA(field4, A_Star))
 				{
-					node = transformWholeRowRef(pstate, rte, cref->location);
+					node = transformWholeRowRef(pstate, nsitem, levels_up,
+												cref->location);
 					break;
 				}
 
 				Assert(IsA(field4, String));
 				colname = strVal(field4);
 
-				/* Try to identify as a column of the RTE */
-				node = scanRTEForColumn(pstate, rte, colname, cref->location,
-										0, NULL);
+				/* Try to identify as a column of the nsitem */
+				node = scanNSItemForColumn(pstate, nsitem, levels_up, colname,
+										   cref->location);
 				if (node == NULL)
 				{
 					/* Try it as a function call on the whole row */
-					node = transformWholeRowRef(pstate, rte, cref->location);
+					node = transformWholeRowRef(pstate, nsitem, levels_up,
+												cref->location);
 					node = ParseFuncOrColumn(pstate,
 											 list_make1(makeString(colname)),
 											 list_make1(node),
@@ -954,7 +957,7 @@ transformAExprOp(ParseState *pstate, A_Expr *a)
 		list_length(a->name) == 1 &&
 		strcmp(strVal(linitial(a->name)), "=") == 0 &&
 		(exprIsNullConstant(lexpr) || exprIsNullConstant(rexpr)) &&
-		(!IsA(lexpr, CaseTestExpr) &&!IsA(rexpr, CaseTestExpr)))
+		(!IsA(lexpr, CaseTestExpr) && !IsA(rexpr, CaseTestExpr)))
 	{
 		NullTest   *n = makeNode(NullTest);
 
@@ -1024,7 +1027,7 @@ transformAExprOpAny(ParseState *pstate, A_Expr *a)
 	Node	   *rexpr = a->rexpr;
 
 	if (operator_precedence_warning)
-		emit_precedence_warnings(pstate, PREC_GROUP_POSTFIX_OP,
+		emit_precedence_warnings(pstate, PREC_GROUP_ANY_ALL,
 								 strVal(llast(a->name)),
 								 lexpr, NULL,
 								 a->location);
@@ -1047,7 +1050,7 @@ transformAExprOpAll(ParseState *pstate, A_Expr *a)
 	Node	   *rexpr = a->rexpr;
 
 	if (operator_precedence_warning)
-		emit_precedence_warnings(pstate, PREC_GROUP_POSTFIX_OP,
+		emit_precedence_warnings(pstate, PREC_GROUP_ANY_ALL,
 								 strVal(llast(a->name)),
 								 lexpr, NULL,
 								 a->location);
@@ -1157,51 +1160,6 @@ transformAExprNullIf(ParseState *pstate, A_Expr *a)
 	 * We rely on NullIfExpr and OpExpr being the same struct
 	 */
 	NodeSetTag(result, T_NullIfExpr);
-
-	return (Node *) result;
-}
-
-/*
- * Checking an expression for match to a list of type names. Will result
- * in a boolean constant node.
- */
-static Node *
-transformAExprOf(ParseState *pstate, A_Expr *a)
-{
-	Node	   *lexpr = a->lexpr;
-	Const	   *result;
-	ListCell   *telem;
-	Oid			ltype,
-				rtype;
-	bool		matched = false;
-
-	if (operator_precedence_warning)
-		emit_precedence_warnings(pstate, PREC_GROUP_POSTFIX_IS, "IS",
-								 lexpr, NULL,
-								 a->location);
-
-	lexpr = transformExprRecurse(pstate, lexpr);
-
-	ltype = exprType(lexpr);
-	foreach(telem, (List *) a->rexpr)
-	{
-		rtype = typenameTypeId(pstate, lfirst(telem));
-		matched = (rtype == ltype);
-		if (matched)
-			break;
-	}
-
-	/*
-	 * We have two forms: equals or not equals. Flip the sense of the result
-	 * for not equals.
-	 */
-	if (strcmp(strVal(linitial(a->name)), "<>") == 0)
-		matched = (!matched);
-
-	result = (Const *) makeBoolConst(matched, false);
-
-	/* Make the result have the original input's parse location */
-	result->location = exprLocation((Node *) a);
 
 	return (Node *) result;
 }
@@ -1691,11 +1649,12 @@ transformMultiAssignRef(ParseState *pstate, MultiAssignRef *maref)
 		/*
 		 * If we're at the last column, delete the RowExpr from
 		 * p_multiassign_exprs; we don't need it anymore, and don't want it in
-		 * the finished UPDATE tlist.
+		 * the finished UPDATE tlist.  We assume this is still the last entry
+		 * in p_multiassign_exprs.
 		 */
 		if (maref->colno == maref->ncolumns)
 			pstate->p_multiassign_exprs =
-				list_delete_ptr(pstate->p_multiassign_exprs, tle);
+				list_delete_last(pstate->p_multiassign_exprs);
 
 		return result;
 	}
@@ -2012,7 +1971,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 										 sublink->testexpr, NULL,
 										 sublink->location);
 			else
-				emit_precedence_warnings(pstate, PREC_GROUP_POSTFIX_OP,
+				emit_precedence_warnings(pstate, PREC_GROUP_ANY_ALL,
 										 strVal(llast(sublink->operName)),
 										 sublink->testexpr, NULL,
 										 sublink->location);
@@ -2648,14 +2607,9 @@ transformBooleanTest(ParseState *pstate, BooleanTest *b)
 static Node *
 transformCurrentOfExpr(ParseState *pstate, CurrentOfExpr *cexpr)
 {
-	int			sublevels_up;
-
 	/* CURRENT OF can only appear at top level of UPDATE/DELETE */
-	Assert(pstate->p_target_rangetblentry != NULL);
-	cexpr->cvarno = RTERangeTablePosn(pstate,
-									  pstate->p_target_rangetblentry,
-									  &sublevels_up);
-	Assert(sublevels_up == 0);
+	Assert(pstate->p_target_nsitem != NULL);
+	cexpr->cvarno = pstate->p_target_nsitem->p_rtindex;
 
 	/*
 	 * Check to see if the cursor name matches a parameter of type REFCURSOR.
@@ -2703,14 +2657,10 @@ transformCurrentOfExpr(ParseState *pstate, CurrentOfExpr *cexpr)
  * Construct a whole-row reference to represent the notation "relation.*".
  */
 static Node *
-transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte, int location)
+transformWholeRowRef(ParseState *pstate, ParseNamespaceItem *nsitem,
+					 int sublevels_up, int location)
 {
 	Var		   *result;
-	int			vnum;
-	int			sublevels_up;
-
-	/* Find the RTE's rangetable location */
-	vnum = RTERangeTablePosn(pstate, rte, &sublevels_up);
 
 	/*
 	 * Build the appropriate referencing node.  Note that if the RTE is a
@@ -2720,13 +2670,14 @@ transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte, int location)
 	 * historically.  One argument for it is that "rel" and "rel.*" mean the
 	 * same thing for composite relations, so why not for scalar functions...
 	 */
-	result = makeWholeRowVar(rte, vnum, sublevels_up, true);
+	result = makeWholeRowVar(nsitem->p_rte, nsitem->p_rtindex,
+							 sublevels_up, true);
 
 	/* location is not filled in by makeWholeRowVar */
 	result->location = location;
 
 	/* mark relation as requiring whole-row SELECT access */
-	markVarForSelectPriv(pstate, result, rte);
+	markVarForSelectPriv(pstate, result, nsitem->p_rte);
 
 	return (Node *) result;
 }
@@ -3245,39 +3196,17 @@ operator_precedence_group(Node *node, const char **nodename)
 				group = PREC_GROUP_PREFIX_OP;
 			}
 		}
-		else if (aexpr->kind == AEXPR_OP &&
-				 aexpr->lexpr != NULL &&
-				 aexpr->rexpr == NULL)
-		{
-			/* postfix operator */
-			if (list_length(aexpr->name) == 1)
-			{
-				*nodename = strVal(linitial(aexpr->name));
-				group = PREC_GROUP_POSTFIX_OP;
-			}
-			else
-			{
-				/* schema-qualified operator syntax */
-				*nodename = "OPERATOR()";
-				group = PREC_GROUP_POSTFIX_OP;
-			}
-		}
 		else if (aexpr->kind == AEXPR_OP_ANY ||
 				 aexpr->kind == AEXPR_OP_ALL)
 		{
 			*nodename = strVal(llast(aexpr->name));
-			group = PREC_GROUP_POSTFIX_OP;
+			group = PREC_GROUP_ANY_ALL;
 		}
 		else if (aexpr->kind == AEXPR_DISTINCT ||
 				 aexpr->kind == AEXPR_NOT_DISTINCT)
 		{
 			*nodename = "IS";
 			group = PREC_GROUP_INFIX_IS;
-		}
-		else if (aexpr->kind == AEXPR_OF)
-		{
-			*nodename = "IS";
-			group = PREC_GROUP_POSTFIX_IS;
 		}
 		else if (aexpr->kind == AEXPR_IN)
 		{
@@ -3357,7 +3286,7 @@ operator_precedence_group(Node *node, const char **nodename)
 			else
 			{
 				*nodename = strVal(llast(s->operName));
-				group = PREC_GROUP_POSTFIX_OP;
+				group = PREC_GROUP_ANY_ALL;
 			}
 		}
 	}
@@ -3433,9 +3362,8 @@ emit_precedence_warnings(ParseState *pstate,
 	 * Complain if left child, which should be same or higher precedence
 	 * according to current rules, used to be lower precedence.
 	 *
-	 * Exception to precedence rules: if left child is IN or NOT IN or a
-	 * postfix operator, the grouping is syntactically forced regardless of
-	 * precedence.
+	 * Exception to precedence rules: if left child is IN or NOT IN the
+	 * grouping is syntactically forced regardless of precedence.
 	 */
 	cgroup = operator_precedence_group(lchild, &copname);
 	if (cgroup > 0)
@@ -3443,7 +3371,7 @@ emit_precedence_warnings(ParseState *pstate,
 		if (oldprecedence_l[cgroup] < oldprecedence_r[opgroup] &&
 			cgroup != PREC_GROUP_IN &&
 			cgroup != PREC_GROUP_NOT_IN &&
-			cgroup != PREC_GROUP_POSTFIX_OP &&
+			cgroup != PREC_GROUP_ANY_ALL &&
 			cgroup != PREC_GROUP_POSTFIX_IS)
 			ereport(WARNING,
 					(errmsg("operator precedence change: %s is now lower precedence than %s",

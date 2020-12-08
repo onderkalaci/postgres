@@ -5,7 +5,7 @@
  *	  (pg_partitioned_table)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_partitioned_table.h
@@ -41,13 +41,17 @@ CATALOG(pg_partitioned_table,3350,PartitionedRelationId)
 	 * field of a heap tuple can be reliably accessed using its C struct
 	 * offset, as previous fields are all non-nullable fixed-length fields.
 	 */
-	int2vector	partattrs;		/* each member of the array is the attribute
-								 * number of a partition key column, or 0 if
-								 * the column is actually an expression */
+	int2vector	partattrs BKI_FORCE_NOT_NULL;	/* each member of the array is
+												 * the attribute number of a
+												 * partition key column, or 0
+												 * if the column is actually
+												 * an expression */
 
 #ifdef CATALOG_VARLEN
-	oidvector	partclass;		/* operator class to compare keys */
-	oidvector	partcollation;	/* user-specified collation for keys */
+	oidvector	partclass BKI_FORCE_NOT_NULL;	/* operator class to compare
+												 * keys */
+	oidvector	partcollation BKI_FORCE_NOT_NULL;	/* user-specified
+													 * collation for keys */
 	pg_node_tree partexprs;		/* list of expressions in the partition key;
 								 * one item for each zero entry in partattrs[] */
 #endif
@@ -59,5 +63,10 @@ CATALOG(pg_partitioned_table,3350,PartitionedRelationId)
  * ----------------
  */
 typedef FormData_pg_partitioned_table *Form_pg_partitioned_table;
+
+DECLARE_TOAST(pg_partitioned_table, 4165, 4166);
+
+DECLARE_UNIQUE_INDEX(pg_partitioned_table_partrelid_index, 3351, on pg_partitioned_table using btree(partrelid oid_ops));
+#define PartitionedRelidIndexId			 3351
 
 #endif							/* PG_PARTITIONED_TABLE_H */

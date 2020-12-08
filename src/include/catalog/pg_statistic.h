@@ -4,7 +4,7 @@
  *	  definition of the "statistics" system catalog (pg_statistic)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_statistic.h
@@ -132,6 +132,11 @@ CATALOG(pg_statistic,2619,StatisticRelationId)
  * ----------------
  */
 typedef FormData_pg_statistic *Form_pg_statistic;
+
+DECLARE_TOAST(pg_statistic, 2840, 2841);
+
+DECLARE_UNIQUE_INDEX(pg_statistic_relid_att_inh_index, 2696, on pg_statistic using btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops));
+#define StatisticRelidAttnumInhIndexId	2696
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 

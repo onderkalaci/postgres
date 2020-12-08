@@ -12,7 +12,7 @@
  * example.  For the most part, however, code outside the core planner
  * should not need to include any optimizer/ header except this one.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/optimizer.h
@@ -58,17 +58,23 @@ extern Selectivity clause_selectivity(PlannerInfo *root,
 									  int varRelid,
 									  JoinType jointype,
 									  SpecialJoinInfo *sjinfo);
-extern Selectivity clauselist_selectivity_simple(PlannerInfo *root,
-												 List *clauses,
-												 int varRelid,
-												 JoinType jointype,
-												 SpecialJoinInfo *sjinfo,
-												 Bitmapset *estimatedclauses);
+extern Selectivity clause_selectivity_ext(PlannerInfo *root,
+										  Node *clause,
+										  int varRelid,
+										  JoinType jointype,
+										  SpecialJoinInfo *sjinfo,
+										  bool use_extended_stats);
 extern Selectivity clauselist_selectivity(PlannerInfo *root,
 										  List *clauses,
 										  int varRelid,
 										  JoinType jointype,
 										  SpecialJoinInfo *sjinfo);
+extern Selectivity clauselist_selectivity_ext(PlannerInfo *root,
+											  List *clauses,
+											  int varRelid,
+											  JoinType jointype,
+											  SpecialJoinInfo *sjinfo,
+											  bool use_extended_stats);
 
 /* in path/costsize.c: */
 
@@ -102,7 +108,8 @@ typedef enum
 extern int	force_parallel_mode;
 extern bool parallel_leader_participation;
 
-extern struct PlannedStmt *planner(Query *parse, int cursorOptions,
+extern struct PlannedStmt *planner(Query *parse, const char *query_string,
+								   int cursorOptions,
 								   struct ParamListInfoData *boundParams);
 
 extern Expr *expression_planner(Expr *expr);

@@ -9,7 +9,7 @@
  * context's MemoryContextMethods struct.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -66,6 +66,7 @@ static void MemoryContextStatsPrint(MemoryContext context, void *passthru,
  */
 #define AssertNotInCriticalSection(context) \
 	Assert(CritSectionCount == 0 || (context)->allowInCritSection)
+
 
 /*****************************************************************************
  *	  EXPORTED ROUTINES														 *
@@ -469,13 +470,13 @@ MemoryContextIsEmpty(MemoryContext context)
 Size
 MemoryContextMemAllocated(MemoryContext context, bool recurse)
 {
-	Size	total = context->mem_allocated;
+	Size		total = context->mem_allocated;
 
 	AssertArg(MemoryContextIsValid(context));
 
 	if (recurse)
 	{
-		MemoryContext child = context->firstchild;
+		MemoryContext child;
 
 		for (child = context->firstchild;
 			 child != NULL;

@@ -145,8 +145,8 @@ CREATE FOREIGN TABLE ft6 (
 -- ===================================================================
 -- tests for validator
 -- ===================================================================
--- requiressl, krbsrvname and gsslib are omitted because they depend on
--- configure options
+-- requiressl and some other parameters are omitted because
+-- valid values for them depend on configure options
 ALTER SERVER testserver1 OPTIONS (
 	use_remote_estimate 'false',
 	updatable 'true',
@@ -171,10 +171,10 @@ ALTER SERVER testserver1 OPTIONS (
 	sslcert 'value',
 	sslkey 'value',
 	sslrootcert 'value',
-	sslcrl 'value'
+	sslcrl 'value',
 	--requirepeer 'value',
-	-- krbsrvname 'value',
-	-- gsslib 'value',
+	krbsrvname 'value',
+	gsslib 'value'
 	--replication 'value'
 );
 
@@ -187,6 +187,19 @@ ALTER SERVER testserver1 OPTIONS (DROP extensions);
 
 ALTER USER MAPPING FOR public SERVER testserver1
 	OPTIONS (DROP user, DROP password);
+
+-- Attempt to add a valid option that's not allowed in a user mapping
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD sslmode 'require');
+
+-- But we can add valid ones fine
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD sslpassword 'dummy');
+
+-- Ensure valid options we haven't used in a user mapping yet are
+-- permitted to check validation.
+ALTER USER MAPPING FOR public SERVER testserver1
+	OPTIONS (ADD sslkey 'value', ADD sslcert 'value');
 
 ALTER FOREIGN TABLE ft1 OPTIONS (schema_name 'S 1', table_name 'T 1');
 ALTER FOREIGN TABLE ft2 OPTIONS (schema_name 'S 1', table_name 'T 1');
@@ -294,7 +307,6 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 IS NULL;        -- Nu
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 IS NOT NULL;    -- NullTest
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE round(abs(c1), 0) = 1; -- FuncExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = -c1;          -- OpExpr(l)
-EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE 1 = c1!;           -- OpExpr(r)
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE (c1 IS NOT NULL) IS DISTINCT FROM (c1 IS NOT NULL); -- DistinctExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = ANY(ARRAY[c2, 1, c1 + 0]); -- ScalarArrayOpExpr
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE c1 = (ARRAY[c1,c2,3])[1]; -- SubscriptingRef
@@ -1069,6 +1081,26 @@ SELECT f_test(100);
 DROP FUNCTION f_test(int);
 
 -- ===================================================================
+-- REINDEX
+-- ===================================================================
+-- remote table is not created here
+CREATE FOREIGN TABLE reindex_foreign (c1 int, c2 int)
+  SERVER loopback2 OPTIONS (table_name 'reindex_local');
+REINDEX TABLE reindex_foreign; -- error
+REINDEX TABLE CONCURRENTLY reindex_foreign; -- error
+DROP FOREIGN TABLE reindex_foreign;
+-- partitions and foreign tables
+CREATE TABLE reind_fdw_parent (c1 int) PARTITION BY RANGE (c1);
+CREATE TABLE reind_fdw_0_10 PARTITION OF reind_fdw_parent
+  FOR VALUES FROM (0) TO (10);
+CREATE FOREIGN TABLE reind_fdw_10_20 PARTITION OF reind_fdw_parent
+  FOR VALUES FROM (10) TO (20)
+  SERVER loopback OPTIONS (table_name 'reind_local_10_20');
+REINDEX TABLE reind_fdw_parent; -- ok
+REINDEX TABLE CONCURRENTLY reind_fdw_parent; -- ok
+DROP TABLE reind_fdw_parent;
+
+-- ===================================================================
 -- conversion error
 -- ===================================================================
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE int;
@@ -1177,6 +1209,26 @@ DELETE FROM ft2
   WHERE ft2.c1 > 1200 AND ft2.c1 % 10 = 0 AND ft2.c2 = ft4.c1
   RETURNING 100;
 DELETE FROM ft2 WHERE ft2.c1 > 1200;
+
+-- Test UPDATE with a MULTIEXPR sub-select
+-- (maybe someday this'll be remotely executable, but not today)
+EXPLAIN (verbose, costs off)
+UPDATE ft2 AS target SET (c2, c7) = (
+    SELECT c2 * 10, c7
+        FROM ft2 AS src
+        WHERE target.c1 = src.c1
+) WHERE c1 > 1100;
+UPDATE ft2 AS target SET (c2, c7) = (
+    SELECT c2 * 10, c7
+        FROM ft2 AS src
+        WHERE target.c1 = src.c1
+) WHERE c1 > 1100;
+
+UPDATE ft2 AS target SET (c2) = (
+    SELECT c2 / 10
+        FROM ft2 AS src
+        WHERE target.c1 = src.c1
+) WHERE c1 > 1100;
 
 -- Test UPDATE/DELETE with WHERE or JOIN/ON conditions containing
 -- user-defined operators/functions
@@ -1485,6 +1537,23 @@ DROP TRIGGER trig_stmt_after ON rem1;
 
 DELETE from rem1;
 
+-- Test multiple AFTER ROW triggers on a foreign table
+CREATE TRIGGER trig_row_after1
+AFTER INSERT OR UPDATE OR DELETE ON rem1
+FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
+
+CREATE TRIGGER trig_row_after2
+AFTER INSERT OR UPDATE OR DELETE ON rem1
+FOR EACH ROW EXECUTE PROCEDURE trigger_data(23,'skidoo');
+
+insert into rem1 values(1,'insert');
+update rem1 set f2  = 'update' where f1 = 1;
+update rem1 set f2 = f2 || f2;
+delete from rem1;
+
+-- cleanup
+DROP TRIGGER trig_row_after1 ON rem1;
+DROP TRIGGER trig_row_after2 ON rem1;
 
 -- Test WHEN conditions
 
@@ -2476,6 +2545,104 @@ SELECT a, count(t1) FROM pagg_tab t1 GROUP BY a HAVING avg(b) < 22 ORDER BY 1;
 EXPLAIN (COSTS OFF)
 SELECT b, avg(a), max(a), count(*) FROM pagg_tab GROUP BY b HAVING sum(a) < 700 ORDER BY 1;
 
+-- ===================================================================
+-- access rights and superuser
+-- ===================================================================
+
+-- Non-superuser cannot create a FDW without a password in the connstr
+CREATE ROLE regress_nosuper NOSUPERUSER;
+
+GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO regress_nosuper;
+
+SET ROLE regress_nosuper;
+
+SHOW is_superuser;
+
+-- This will be OK, we can create the FDW
+DO $d$
+    BEGIN
+        EXECUTE $$CREATE SERVER loopback_nopw FOREIGN DATA WRAPPER postgres_fdw
+            OPTIONS (dbname '$$||current_database()||$$',
+                     port '$$||current_setting('port')||$$'
+            )$$;
+    END;
+$d$;
+
+-- But creation of user mappings for non-superusers should fail
+CREATE USER MAPPING FOR public SERVER loopback_nopw;
+CREATE USER MAPPING FOR CURRENT_USER SERVER loopback_nopw;
+
+CREATE FOREIGN TABLE ft1_nopw (
+	c1 int NOT NULL,
+	c2 int NOT NULL,
+	c3 text,
+	c4 timestamptz,
+	c5 timestamp,
+	c6 varchar(10),
+	c7 char(10) default 'ft1',
+	c8 user_enum
+) SERVER loopback_nopw OPTIONS (schema_name 'public', table_name 'ft1');
+
+SELECT * FROM ft1_nopw LIMIT 1;
+
+-- If we add a password to the connstr it'll fail, because we don't allow passwords
+-- in connstrs only in user mappings.
+
+DO $d$
+    BEGIN
+        EXECUTE $$ALTER SERVER loopback_nopw OPTIONS (ADD password 'dummypw')$$;
+    END;
+$d$;
+
+-- If we add a password for our user mapping instead, we should get a different
+-- error because the password wasn't actually *used* when we run with trust auth.
+--
+-- This won't work with installcheck, but neither will most of the FDW checks.
+
+ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD password 'dummypw');
+
+SELECT * FROM ft1_nopw LIMIT 1;
+
+-- Unpriv user cannot make the mapping passwordless
+ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD password_required 'false');
+
+
+SELECT * FROM ft1_nopw LIMIT 1;
+
+RESET ROLE;
+
+-- But the superuser can
+ALTER USER MAPPING FOR regress_nosuper SERVER loopback_nopw OPTIONS (ADD password_required 'false');
+
+SET ROLE regress_nosuper;
+
+-- Should finally work now
+SELECT * FROM ft1_nopw LIMIT 1;
+
+-- unpriv user also cannot set sslcert / sslkey on the user mapping
+-- first set password_required so we see the right error messages
+ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (SET password_required 'true');
+ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD sslcert 'foo.crt');
+ALTER USER MAPPING FOR CURRENT_USER SERVER loopback_nopw OPTIONS (ADD sslkey 'foo.key');
+
+-- We're done with the role named after a specific user and need to check the
+-- changes to the public mapping.
+DROP USER MAPPING FOR CURRENT_USER SERVER loopback_nopw;
+
+-- This will fail again as it'll resolve the user mapping for public, which
+-- lacks password_required=false
+SELECT * FROM ft1_nopw LIMIT 1;
+
+RESET ROLE;
+
+-- The user mapping for public is passwordless and lacks the password_required=false
+-- mapping option, but will work because the current user is a superuser.
+SELECT * FROM ft1_nopw LIMIT 1;
+
+-- cleanup
+DROP USER MAPPING FOR public SERVER loopback_nopw;
+DROP OWNED BY regress_nosuper;
+DROP ROLE regress_nosuper;
 
 -- Clean-up
 RESET enable_partitionwise_aggregate;
@@ -2486,3 +2653,47 @@ SELECT count(*) FROM ft1;
 -- error here
 PREPARE TRANSACTION 'fdw_tpc';
 ROLLBACK;
+
+-- ===================================================================
+-- reestablish new connection
+-- ===================================================================
+
+-- Terminate the backend having the specified application_name and wait for
+-- the termination to complete.
+CREATE OR REPLACE PROCEDURE terminate_backend_and_wait(appname text) AS $$
+BEGIN
+    PERFORM pg_terminate_backend(pid) FROM pg_stat_activity
+    WHERE application_name = appname;
+    LOOP
+        PERFORM * FROM pg_stat_activity WHERE application_name = appname;
+        EXIT WHEN NOT FOUND;
+        PERFORM pg_sleep(1), pg_stat_clear_snapshot();
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Change application_name of remote connection to special one
+-- so that we can easily terminate the connection later.
+ALTER SERVER loopback OPTIONS (application_name 'fdw_retry_check');
+SELECT 1 FROM ft1 LIMIT 1;
+
+-- Terminate the remote connection.
+CALL terminate_backend_and_wait('fdw_retry_check');
+
+-- This query should detect the broken connection when starting new remote
+-- transaction, reestablish new connection, and then succeed.
+BEGIN;
+SELECT 1 FROM ft1 LIMIT 1;
+
+-- If the query detects the broken connection when starting new remote
+-- subtransaction, it doesn't reestablish new connection and should fail.
+-- The text of the error might vary across platforms, so don't show it.
+CALL terminate_backend_and_wait('fdw_retry_check');
+SAVEPOINT s;
+\set VERBOSITY sqlstate
+SELECT 1 FROM ft1 LIMIT 1;    -- should fail
+\set VERBOSITY default
+COMMIT;
+
+-- Clean up
+DROP PROCEDURE terminate_backend_and_wait(text);

@@ -3,7 +3,7 @@
  *
  * PostgreSQL commit timestamp manager
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/commit_ts.h
@@ -14,6 +14,7 @@
 #include "access/xlog.h"
 #include "datatype/timestamp.h"
 #include "replication/origin.h"
+#include "storage/sync.h"
 #include "utils/guc.h"
 
 
@@ -44,6 +45,8 @@ extern void TruncateCommitTs(TransactionId oldestXact);
 extern void SetCommitTsLimit(TransactionId oldestXact,
 							 TransactionId newestXact);
 extern void AdvanceOldestCommitTsXid(TransactionId oldestXact);
+
+extern int	committssyncfiletag(const FileTag *ftag, char *path);
 
 /* XLOG stuff */
 #define COMMIT_TS_ZEROPAGE		0x00

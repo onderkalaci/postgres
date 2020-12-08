@@ -9,7 +9,7 @@
  * and implementing search-path-controlled searches.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -126,6 +126,11 @@
  * namespaceUser is the userid the path has been computed for.
  *
  * Note: all data pointed to by these List variables is in TopMemoryContext.
+ *
+ * activePathGeneration is incremented whenever the effective values of
+ * activeSearchPath/activeCreationNamespace/activeTempCreationPending change.
+ * This can be used to quickly detect whether any change has happened since
+ * a previous examination of the search path state.
  */
 
 /* These variables define the actually active state: */
@@ -137,6 +142,9 @@ static Oid	activeCreationNamespace = InvalidOid;
 
 /* if true, activeCreationNamespace is wrong, it should be temp namespace */
 static bool activeTempCreationPending = false;
+
+/* current generation counter; make sure this is never zero */
+static uint64 activePathGeneration = 1;
 
 /* These variables are the values last derived from namespace_search_path: */
 
@@ -1465,8 +1473,7 @@ FunctionIsVisible(Oid funcid)
  *		Given a possibly-qualified operator name and exact input datatypes,
  *		look up the operator.  Returns InvalidOid if not found.
  *
- * Pass oprleft = InvalidOid for a prefix op, oprright = InvalidOid for
- * a postfix op.
+ * Pass oprleft = InvalidOid for a prefix op.
  *
  * If the operator name is not schema-qualified, it is sought in the current
  * namespace search path.  If the name is schema-qualified and the given
@@ -1572,8 +1579,8 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
  * namespace case, we arrange for entries in earlier namespaces to mask
  * identical entries in later namespaces.
  *
- * The returned items always have two args[] entries --- one or the other
- * will be InvalidOid for a prefix or postfix oprkind.  nargs is 2, too.
+ * The returned items always have two args[] entries --- the first will be
+ * InvalidOid for a prefix oprkind.  nargs is always 2, too.
  */
 FuncCandidateList
 OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
@@ -3217,7 +3224,7 @@ isOtherTempNamespace(Oid namespaceId)
 }
 
 /*
- * isTempNamespaceInUse - is the given namespace owned and actively used
+ * checkTempNamespaceStatus - is the given namespace owned and actively used
  * by a backend?
  *
  * Note: this can be used while scanning relations in pg_class to detect
@@ -3225,8 +3232,8 @@ isOtherTempNamespace(Oid namespaceId)
  * given database.  The result may be out of date quickly, so the caller
  * must be careful how to handle this information.
  */
-bool
-isTempNamespaceInUse(Oid namespaceId)
+TempNamespaceStatus
+checkTempNamespaceStatus(Oid namespaceId)
 {
 	PGPROC	   *proc;
 	int			backendId;
@@ -3235,25 +3242,25 @@ isTempNamespaceInUse(Oid namespaceId)
 
 	backendId = GetTempNamespaceBackendId(namespaceId);
 
-	if (backendId == InvalidBackendId ||
-		backendId == MyBackendId)
-		return false;
+	/* No such namespace, or its name shows it's not temp? */
+	if (backendId == InvalidBackendId)
+		return TEMP_NAMESPACE_NOT_TEMP;
 
 	/* Is the backend alive? */
 	proc = BackendIdGetProc(backendId);
 	if (proc == NULL)
-		return false;
+		return TEMP_NAMESPACE_IDLE;
 
 	/* Is the backend connected to the same database we are looking at? */
 	if (proc->databaseId != MyDatabaseId)
-		return false;
+		return TEMP_NAMESPACE_IDLE;
 
 	/* Does the backend own the temporary namespace? */
 	if (proc->tempNamespaceId != namespaceId)
-		return false;
+		return TEMP_NAMESPACE_IDLE;
 
-	/* all good to go */
-	return true;
+	/* Yup, so namespace is busy */
+	return TEMP_NAMESPACE_IN_USE;
 }
 
 /*
@@ -3373,6 +3380,7 @@ GetOverrideSearchPath(MemoryContext context)
 		schemas = list_delete_first(schemas);
 	}
 	result->schemas = schemas;
+	result->generation = activePathGeneration;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -3393,12 +3401,18 @@ CopyOverrideSearchPath(OverrideSearchPath *path)
 	result->schemas = list_copy(path->schemas);
 	result->addCatalog = path->addCatalog;
 	result->addTemp = path->addTemp;
+	result->generation = path->generation;
 
 	return result;
 }
 
 /*
  * OverrideSearchPathMatchesCurrent - does path match current setting?
+ *
+ * This is tested over and over in some common code paths, and in the typical
+ * scenario where the active search path seldom changes, it'll always succeed.
+ * We make that case fast by keeping a generation counter that is advanced
+ * whenever the active search path changes.
  */
 bool
 OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
@@ -3407,6 +3421,10 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
 			   *lcp;
 
 	recomputeNamespacePath();
+
+	/* Quick out if already known equal to active path. */
+	if (path->generation == activePathGeneration)
+		return true;
 
 	/* We scan down the activeSearchPath to see if it matches the input. */
 	lc = list_head(activeSearchPath);
@@ -3440,6 +3458,13 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
 	}
 	if (lc)
 		return false;
+
+	/*
+	 * Update path->generation so that future tests will return quickly, so
+	 * long as the active search path doesn't change.
+	 */
+	path->generation = activePathGeneration;
+
 	return true;
 }
 
@@ -3510,6 +3535,14 @@ PushOverrideSearchPath(OverrideSearchPath *newpath)
 	activeCreationNamespace = entry->creationNamespace;
 	activeTempCreationPending = false;	/* XXX is this OK? */
 
+	/*
+	 * We always increment activePathGeneration when pushing/popping an
+	 * override path.  In current usage, these actions always change the
+	 * effective path state, so there's no value in checking to see if it
+	 * didn't change.
+	 */
+	activePathGeneration++;
+
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -3551,6 +3584,9 @@ PopOverrideSearchPath(void)
 		activeCreationNamespace = baseCreationNamespace;
 		activeTempCreationPending = baseTempCreationPending;
 	}
+
+	/* As above, the generation always increments. */
+	activePathGeneration++;
 }
 
 
@@ -3707,6 +3743,7 @@ recomputeNamespacePath(void)
 	ListCell   *l;
 	bool		temp_missing;
 	Oid			firstNS;
+	bool		pathChanged;
 	MemoryContext oldcxt;
 
 	/* Do nothing if an override search spec is active. */
@@ -3814,18 +3851,31 @@ recomputeNamespacePath(void)
 		oidlist = lcons_oid(myTempNamespace, oidlist);
 
 	/*
-	 * Now that we've successfully built the new list of namespace OIDs, save
-	 * it in permanent storage.
+	 * We want to detect the case where the effective value of the base search
+	 * path variables didn't change.  As long as we're doing so, we can avoid
+	 * copying the OID list unnecessarily.
 	 */
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-	newpath = list_copy(oidlist);
-	MemoryContextSwitchTo(oldcxt);
+	if (baseCreationNamespace == firstNS &&
+		baseTempCreationPending == temp_missing &&
+		equal(oidlist, baseSearchPath))
+	{
+		pathChanged = false;
+	}
+	else
+	{
+		pathChanged = true;
 
-	/* Now safe to assign to state variables. */
-	list_free(baseSearchPath);
-	baseSearchPath = newpath;
-	baseCreationNamespace = firstNS;
-	baseTempCreationPending = temp_missing;
+		/* Must save OID list in permanent storage. */
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		newpath = list_copy(oidlist);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* Now safe to assign to state variables. */
+		list_free(baseSearchPath);
+		baseSearchPath = newpath;
+		baseCreationNamespace = firstNS;
+		baseTempCreationPending = temp_missing;
+	}
 
 	/* Mark the path valid. */
 	baseSearchPathValid = true;
@@ -3835,6 +3885,16 @@ recomputeNamespacePath(void)
 	activeSearchPath = baseSearchPath;
 	activeCreationNamespace = baseCreationNamespace;
 	activeTempCreationPending = baseTempCreationPending;
+
+	/*
+	 * Bump the generation only if something actually changed.  (Notice that
+	 * what we compared to was the old state of the base path variables; so
+	 * this does not deal with the situation where we have just popped an
+	 * override path and restored the prior state of the base path.  Instead
+	 * we rely on the override-popping logic to have bumped the generation.)
+	 */
+	if (pathChanged)
+		activePathGeneration++;
 
 	/* Clean up. */
 	pfree(rawname);
@@ -3908,7 +3968,7 @@ InitTempTableNamespace(void)
 	 * Do not allow a Hot Standby session to make temp tables.  Aside from
 	 * problems with modifying the system catalogs, there is a naming
 	 * conflict: pg_temp_N belongs to the session with BackendId N on the
-	 * master, not to a hot standby session with the same BackendId.  We
+	 * primary, not to a hot standby session with the same BackendId.  We
 	 * should not be able to get here anyway due to XactReadOnly checks, but
 	 * let's just make real sure.  Note that this also backstops various
 	 * operations that allow XactReadOnly transactions to modify temp tables;
@@ -4054,6 +4114,8 @@ AtEOXact_Namespace(bool isCommit, bool parallel)
 		activeSearchPath = baseSearchPath;
 		activeCreationNamespace = baseCreationNamespace;
 		activeTempCreationPending = baseTempCreationPending;
+		/* Always bump generation --- see note in recomputeNamespacePath */
+		activePathGeneration++;
 	}
 }
 
@@ -4109,6 +4171,8 @@ AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 		overrideStack = list_delete_first(overrideStack);
 		list_free(entry->searchPath);
 		pfree(entry);
+		/* Always bump generation --- see note in recomputeNamespacePath */
+		activePathGeneration++;
 	}
 
 	/* Activate the next level down. */
@@ -4118,6 +4182,12 @@ AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 		activeSearchPath = entry->searchPath;
 		activeCreationNamespace = entry->creationNamespace;
 		activeTempCreationPending = false;	/* XXX is this OK? */
+
+		/*
+		 * It's probably unnecessary to bump generation here, but this should
+		 * not be a performance-critical case, so better to be over-cautious.
+		 */
+		activePathGeneration++;
 	}
 	else
 	{
@@ -4125,6 +4195,12 @@ AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 		activeSearchPath = baseSearchPath;
 		activeCreationNamespace = baseCreationNamespace;
 		activeTempCreationPending = baseTempCreationPending;
+
+		/*
+		 * If we popped an override stack entry, then we already bumped the
+		 * generation above.  If we did not, then the above assignments did
+		 * nothing and we need not bump the generation.
+		 */
 	}
 }
 
@@ -4264,6 +4340,7 @@ InitializeSearchPath(void)
 		activeSearchPath = baseSearchPath;
 		activeCreationNamespace = baseCreationNamespace;
 		activeTempCreationPending = baseTempCreationPending;
+		activePathGeneration++; /* pro forma */
 	}
 	else
 	{

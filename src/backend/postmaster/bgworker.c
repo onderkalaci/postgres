@@ -2,7 +2,7 @@
  * bgworker.c
  *		POSTGRES pluggable background workers implementation
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/postmaster/bgworker.c
@@ -12,14 +12,13 @@
 
 #include "postgres.h"
 
-#include <unistd.h>
-
 #include "access/parallel.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
@@ -251,10 +250,10 @@ BackgroundWorkerStateChange(void)
 	 */
 	if (max_worker_processes != BackgroundWorkerData->total_slots)
 	{
-		elog(LOG,
-			 "inconsistent background worker state (max_worker_processes=%d, total_slots=%d",
-			 max_worker_processes,
-			 BackgroundWorkerData->total_slots);
+		ereport(LOG,
+				(errmsg("inconsistent background worker state (max_worker_processes=%d, total_slots=%d)",
+						max_worker_processes,
+						BackgroundWorkerData->total_slots)));
 		return;
 	}
 
@@ -641,26 +640,6 @@ SanityCheckBackgroundWorker(BackgroundWorker *worker, int elevel)
 	return true;
 }
 
-static void
-bgworker_quickdie(SIGNAL_ARGS)
-{
-	/*
-	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
-	 * because shared memory may be corrupted, so we don't want to try to
-	 * clean up our transaction.  Just nail the windows shut and get out of
-	 * town.  The callbacks wouldn't be safe to run from a signal handler,
-	 * anyway.
-	 *
-	 * Note we do _exit(2) not _exit(0).  This is to force the postmaster into
-	 * a system reset cycle if someone sends a manual SIGQUIT to a random
-	 * backend.  This is necessary precisely because we don't clean up our
-	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
-	 * should ensure the postmaster sees this as a crash, too, but no harm in
-	 * being doubly sure.)
-	 */
-	_exit(2);
-}
-
 /*
  * Standard SIGTERM handler for background workers
  */
@@ -709,8 +688,8 @@ StartBackgroundWorker(void)
 
 	IsBackgroundWorker = true;
 
-	/* Identify myself via ps */
-	init_ps_display(worker->bgw_name, "", "", "");
+	MyBackendType = B_BG_WORKER;
+	init_ps_display(worker->bgw_name);
 
 	/*
 	 * If we're not supposed to have shared memory access, then detach from
@@ -752,9 +731,9 @@ StartBackgroundWorker(void)
 		pqsignal(SIGFPE, SIG_IGN);
 	}
 	pqsignal(SIGTERM, bgworker_die);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGHUP, SIG_IGN);
 
-	pqsignal(SIGQUIT, bgworker_quickdie);
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 
 	pqsignal(SIGPIPE, SIG_IGN);
@@ -764,7 +743,7 @@ StartBackgroundWorker(void)
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
-	 * See notes in postgres.c about the design of this coding.
+	 * We just need to clean up, report the error, and go away.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -774,7 +753,14 @@ StartBackgroundWorker(void)
 		/* Prevent interrupts while cleaning up */
 		HOLD_INTERRUPTS();
 
-		/* Report the error to the server log */
+		/*
+		 * sigsetjmp will have blocked all signals, but we may need to accept
+		 * signals while communicating with our parallel leader.  Once we've
+		 * done HOLD_INTERRUPTS() it should be safe to unblock signals.
+		 */
+		BackgroundWorkerUnblockSignals();
+
+		/* Report the error to the parallel leader and the server log */
 		EmitErrorReport();
 
 		/*
@@ -1170,7 +1156,7 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
  * Instruct the postmaster to terminate a background worker.
  *
  * Note that it's safe to do this without regard to whether the worker is
- * still running, or even if the worker may already have existed and been
+ * still running, or even if the worker may already have exited and been
  * unregistered.
  */
 void

@@ -3,7 +3,7 @@
  * misc.c
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include <sys/file.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <math.h>
 #include <unistd.h>
 
@@ -194,72 +195,82 @@ current_query(PG_FUNCTION_ARGS)
 
 /* Function to find out which databases make use of a tablespace */
 
-typedef struct
-{
-	char	   *location;
-	DIR		   *dirdesc;
-} ts_db_fctx;
-
 Datum
 pg_tablespace_databases(PG_FUNCTION_ARGS)
 {
-	FuncCallContext *funcctx;
+	Oid			tablespaceOid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	bool		randomAccess;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	char	   *location;
+	DIR		   *dirdesc;
 	struct dirent *de;
-	ts_db_fctx *fctx;
+	MemoryContext oldcontext;
 
-	if (SRF_IS_FIRSTCALL())
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* The tupdesc and tuplestore must be created in ecxt_per_query_memory */
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pg_tablespace_databases",
+					   OIDOID, -1, 0);
+
+	randomAccess = (rsinfo->allowedModes & SFRM_Materialize_Random) != 0;
+	tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
+
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	if (tablespaceOid == GLOBALTABLESPACE_OID)
 	{
-		MemoryContext oldcontext;
-		Oid			tablespaceOid = PG_GETARG_OID(0);
-
-		funcctx = SRF_FIRSTCALL_INIT();
-		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-		fctx = palloc(sizeof(ts_db_fctx));
-
-		if (tablespaceOid == GLOBALTABLESPACE_OID)
-		{
-			fctx->dirdesc = NULL;
-			ereport(WARNING,
-					(errmsg("global tablespace never has databases")));
-		}
-		else
-		{
-			if (tablespaceOid == DEFAULTTABLESPACE_OID)
-				fctx->location = psprintf("base");
-			else
-				fctx->location = psprintf("pg_tblspc/%u/%s", tablespaceOid,
-										  TABLESPACE_VERSION_DIRECTORY);
-
-			fctx->dirdesc = AllocateDir(fctx->location);
-
-			if (!fctx->dirdesc)
-			{
-				/* the only expected error is ENOENT */
-				if (errno != ENOENT)
-					ereport(ERROR,
-							(errcode_for_file_access(),
-							 errmsg("could not open directory \"%s\": %m",
-									fctx->location)));
-				ereport(WARNING,
-						(errmsg("%u is not a tablespace OID", tablespaceOid)));
-			}
-		}
-		funcctx->user_fctx = fctx;
-		MemoryContextSwitchTo(oldcontext);
+		ereport(WARNING,
+				(errmsg("global tablespace never has databases")));
+		/* return empty tuplestore */
+		return (Datum) 0;
 	}
 
-	funcctx = SRF_PERCALL_SETUP();
-	fctx = (ts_db_fctx *) funcctx->user_fctx;
+	if (tablespaceOid == DEFAULTTABLESPACE_OID)
+		location = psprintf("base");
+	else
+		location = psprintf("pg_tblspc/%u/%s", tablespaceOid,
+							TABLESPACE_VERSION_DIRECTORY);
 
-	if (!fctx->dirdesc)			/* not a tablespace */
-		SRF_RETURN_DONE(funcctx);
+	dirdesc = AllocateDir(location);
 
-	while ((de = ReadDir(fctx->dirdesc, fctx->location)) != NULL)
+	if (!dirdesc)
+	{
+		/* the only expected error is ENOENT */
+		if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open directory \"%s\": %m",
+							location)));
+		ereport(WARNING,
+				(errmsg("%u is not a tablespace OID", tablespaceOid)));
+		/* return empty tuplestore */
+		return (Datum) 0;
+	}
+
+	while ((de = ReadDir(dirdesc, location)) != NULL)
 	{
 		Oid			datOid = atooid(de->d_name);
 		char	   *subdir;
 		bool		isempty;
+		Datum		values[1];
+		bool		nulls[1];
 
 		/* this test skips . and .., but is awfully weak */
 		if (!datOid)
@@ -267,18 +278,21 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 
 		/* if database subdir is empty, don't report tablespace as used */
 
-		subdir = psprintf("%s/%s", fctx->location, de->d_name);
+		subdir = psprintf("%s/%s", location, de->d_name);
 		isempty = directory_is_empty(subdir);
 		pfree(subdir);
 
 		if (isempty)
 			continue;			/* indeed, nothing in it */
 
-		SRF_RETURN_NEXT(funcctx, ObjectIdGetDatum(datOid));
+		values[0] = ObjectIdGetDatum(datOid);
+		nulls[0] = false;
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
-	FreeDir(fctx->dirdesc);
-	SRF_RETURN_DONE(funcctx);
+	FreeDir(dirdesc);
+	return (Datum) 0;
 }
 
 
@@ -402,12 +416,16 @@ pg_get_keywords(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(3);
+		tupdesc = CreateTemplateTupleDesc(5);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "word",
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "catcode",
 						   CHAROID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "catdesc",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "barelabel",
+						   BOOLOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "catdesc",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "baredesc",
 						   TEXTOID, -1, 0);
 
 		funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
@@ -419,7 +437,7 @@ pg_get_keywords(PG_FUNCTION_ARGS)
 
 	if (funcctx->call_cntr < ScanKeywords.num_keywords)
 	{
-		char	   *values[3];
+		char	   *values[5];
 		HeapTuple	tuple;
 
 		/* cast-away-const is ugly but alternatives aren't much better */
@@ -431,24 +449,35 @@ pg_get_keywords(PG_FUNCTION_ARGS)
 		{
 			case UNRESERVED_KEYWORD:
 				values[1] = "U";
-				values[2] = _("unreserved");
+				values[3] = _("unreserved");
 				break;
 			case COL_NAME_KEYWORD:
 				values[1] = "C";
-				values[2] = _("unreserved (cannot be function or type name)");
+				values[3] = _("unreserved (cannot be function or type name)");
 				break;
 			case TYPE_FUNC_NAME_KEYWORD:
 				values[1] = "T";
-				values[2] = _("reserved (can be function or type name)");
+				values[3] = _("reserved (can be function or type name)");
 				break;
 			case RESERVED_KEYWORD:
 				values[1] = "R";
-				values[2] = _("reserved");
+				values[3] = _("reserved");
 				break;
 			default:			/* shouldn't be possible */
 				values[1] = NULL;
-				values[2] = NULL;
+				values[3] = NULL;
 				break;
+		}
+
+		if (ScanKeywordBareLabel[funcctx->call_cntr])
+		{
+			values[2] = "true";
+			values[4] = _("can be bare label");
+		}
+		else
+		{
+			values[2] = "false";
+			values[4] = _("requires AS");
 		}
 
 		tuple = BuildTupleFromCStrings(funcctx->attinmeta, values);
@@ -725,9 +754,6 @@ pg_current_logfile(PG_FUNCTION_ARGS)
 	FILE	   *fd;
 	char		lbuffer[MAXPGPATH];
 	char	   *logfmt;
-	char	   *log_filepath;
-	char	   *log_format = lbuffer;
-	char	   *nlpos;
 
 	/* The log format parameter is optional */
 	if (PG_NARGS() == 0 || PG_ARGISNULL(0))
@@ -754,16 +780,23 @@ pg_current_logfile(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 
+#ifdef WIN32
+	/* syslogger.c writes CRLF line endings on Windows */
+	_setmode(_fileno(fd), _O_TEXT);
+#endif
+
 	/*
 	 * Read the file to gather current log filename(s) registered by the
 	 * syslogger.
 	 */
 	while (fgets(lbuffer, sizeof(lbuffer), fd) != NULL)
 	{
-		/*
-		 * Extract log format and log file path from the line; lbuffer ==
-		 * log_format, they share storage.
-		 */
+		char	   *log_format;
+		char	   *log_filepath;
+		char	   *nlpos;
+
+		/* Extract log format and log file path from the line. */
+		log_format = lbuffer;
 		log_filepath = strchr(lbuffer, ' ');
 		if (log_filepath == NULL)
 		{

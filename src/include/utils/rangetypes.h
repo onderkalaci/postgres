@@ -4,7 +4,7 @@
  *	  Declarations for Postgres range types.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/rangetypes.h
@@ -128,10 +128,10 @@ extern char range_get_flags(const RangeType *range);
 extern void range_set_contain_empty(RangeType *range);
 extern RangeType *make_range(TypeCacheEntry *typcache, RangeBound *lower,
 							 RangeBound *upper, bool empty);
-extern int range_cmp_bounds(TypeCacheEntry *typcache, const RangeBound *b1,
-							const RangeBound *b2);
-extern int range_cmp_bound_values(TypeCacheEntry *typcache, const RangeBound *b1,
-								  const RangeBound *b2);
+extern int	range_cmp_bounds(TypeCacheEntry *typcache, const RangeBound *b1,
+							 const RangeBound *b2);
+extern int	range_cmp_bound_values(TypeCacheEntry *typcache, const RangeBound *b1,
+								   const RangeBound *b2);
 extern bool bounds_adjacent(TypeCacheEntry *typcache, RangeBound bound1,
 							RangeBound bound2);
 extern RangeType *make_empty_range(TypeCacheEntry *typcache);

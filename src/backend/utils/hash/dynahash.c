@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * dynahash.c
- *	  dynamic hash tables
+ *	  dynamic chained hash tables
  *
  * dynahash.c supports both local-to-a-backend hash tables and hash tables in
  * shared memory.  For shared hash tables, it is the caller's responsibility
@@ -41,7 +41,17 @@
  * function must be supplied; comparison defaults to memcmp() and key copying
  * to memcpy() when a user-defined hashing function is selected.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Compared to simplehash, dynahash has the following benefits:
+ *
+ * - It supports partitioning, which is useful for shared memory access using
+ *   locks.
+ * - Shared memory hashes are allocated in a fixed size area at startup and
+ *   are discoverable by name from other processes.
+ * - Because entries don't need to be moved in the case of hash conflicts, has
+ *   better performance for large entries
+ * - Guarantees stable pointers to entries.
+ *
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -86,6 +96,8 @@
 #include <limits.h>
 
 #include "access/xact.h"
+#include "common/hashfn.h"
+#include "port/pg_bitutils.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "utils/dynahash.h"
@@ -110,7 +122,6 @@
 #define DEF_SEGSIZE			   256
 #define DEF_SEGSIZE_SHIFT	   8	/* must be log2(DEF_SEGSIZE) */
 #define DEF_DIRSIZE			   256
-#define DEF_FFACTOR			   1	/* default fill factor */
 
 /* Number of freelists to be used for a partitioned hash table. */
 #define NUM_FREELISTS			32
@@ -179,7 +190,6 @@ struct HASHHDR
 	Size		keysize;		/* hash key length in bytes */
 	Size		entrysize;		/* total user element size in bytes */
 	long		num_partitions; /* # partitions (must be power of 2), or 0 */
-	long		ffactor;		/* target fill factor */
 	long		max_dsize;		/* 'dsize' limit if directory is fixed size */
 	long		ssize;			/* segment size --- must be power of 2 */
 	int			sshift;			/* segment shift = log2(ssize) */
@@ -396,7 +406,16 @@ hash_create(const char *tabname, long nelem, HASHCTL *info, int flags)
 	if (flags & HASH_KEYCOPY)
 		hashp->keycopy = info->keycopy;
 	else if (hashp->hash == string_hash)
-		hashp->keycopy = (HashCopyFunc) strlcpy;
+	{
+		/*
+		 * The signature of keycopy is meant for memcpy(), which returns
+		 * void*, but strlcpy() returns size_t.  Since we never use the return
+		 * value of keycopy, and size_t is pretty much always the same size as
+		 * void *, this should be safe.  The extra cast in the middle is to
+		 * avoid warnings from -Wcast-function-type.
+		 */
+		hashp->keycopy = (HashCopyFunc) (pg_funcptr_t) strlcpy;
+	}
 	else
 		hashp->keycopy = memcpy;
 
@@ -476,8 +495,6 @@ hash_create(const char *tabname, long nelem, HASHCTL *info, int flags)
 		/* ssize had better be a power of 2 */
 		Assert(hctl->ssize == (1L << hctl->sshift));
 	}
-	if (flags & HASH_FFACTOR)
-		hctl->ffactor = info->ffactor;
 
 	/*
 	 * SHM hash tables have fixed directory size passed by the caller.
@@ -582,8 +599,6 @@ hdefault(HTAB *hashp)
 
 	hctl->num_partitions = 0;	/* not partitioned */
 
-	hctl->ffactor = DEF_FFACTOR;
-
 	/* table has no fixed maximum size */
 	hctl->max_dsize = NO_MAX_DSIZE;
 
@@ -649,11 +664,10 @@ init_htab(HTAB *hashp, long nelem)
 			SpinLockInit(&(hctl->freeList[i].mutex));
 
 	/*
-	 * Divide number of elements by the fill factor to determine a desired
-	 * number of buckets.  Allocate space for the next greater power of two
-	 * number of buckets
+	 * Allocate space for the next greater power of two number of buckets,
+	 * assuming a desired maximum load factor of 1.
 	 */
-	nbuckets = next_pow2_int((nelem - 1) / hctl->ffactor + 1);
+	nbuckets = next_pow2_int(nelem);
 
 	/*
 	 * In a partitioned table, nbuckets must be at least equal to
@@ -712,7 +726,6 @@ init_htab(HTAB *hashp, long nelem)
 			"DIRECTORY SIZE  ", hctl->dsize,
 			"SEGMENT SIZE    ", hctl->ssize,
 			"SEGMENT SHIFT   ", hctl->sshift,
-			"FILL FACTOR     ", hctl->ffactor,
 			"MAX BUCKET      ", hctl->max_bucket,
 			"HIGH MASK       ", hctl->high_mask,
 			"LOW  MASK       ", hctl->low_mask,
@@ -740,7 +753,7 @@ hash_estimate_size(long num_entries, Size entrysize)
 				elementAllocCnt;
 
 	/* estimate number of buckets wanted */
-	nBuckets = next_pow2_long((num_entries - 1) / DEF_FFACTOR + 1);
+	nBuckets = next_pow2_long(num_entries);
 	/* # of segments needed for nBuckets */
 	nSegments = next_pow2_long((nBuckets - 1) / DEF_SEGSIZE + 1);
 	/* directory entries */
@@ -783,7 +796,7 @@ hash_select_dirsize(long num_entries)
 				nDirEntries;
 
 	/* estimate number of buckets wanted */
-	nBuckets = next_pow2_long((num_entries - 1) / DEF_FFACTOR + 1);
+	nBuckets = next_pow2_long(num_entries);
 	/* # of segments needed for nBuckets */
 	nSegments = next_pow2_long((nBuckets - 1) / DEF_SEGSIZE + 1);
 	/* directory entries */
@@ -950,11 +963,10 @@ hash_search_with_hash_value(HTAB *hashp,
 	{
 		/*
 		 * Can't split if running in partitioned mode, nor if frozen, nor if
-		 * table is the subject of any active hash_seq_search scans.  Strange
-		 * order of these tests is to try to check cheaper conditions first.
+		 * table is the subject of any active hash_seq_search scans.
 		 */
-		if (!IS_PARTITIONED(hctl) && !hashp->frozen &&
-			hctl->freeList[0].nentries / (long) (hctl->max_bucket + 1) >= hctl->ffactor &&
+		if (hctl->freeList[0].nentries > (long) hctl->max_bucket &&
+			!IS_PARTITIONED(hctl) && !hashp->frozen &&
 			!has_seq_scans(hashp))
 			(void) expand_table(hashp);
 	}
@@ -1717,16 +1729,18 @@ hash_corrupted(HTAB *hashp)
 int
 my_log2(long num)
 {
-	int			i;
-	long		limit;
-
-	/* guard against too-large input, which would put us into infinite loop */
+	/*
+	 * guard against too-large input, which would be invalid for
+	 * pg_ceil_log2_*()
+	 */
 	if (num > LONG_MAX / 2)
 		num = LONG_MAX / 2;
 
-	for (i = 0, limit = 1; limit < num; i++, limit <<= 1)
-		;
-	return i;
+#if SIZEOF_LONG < 8
+	return pg_ceil_log2_32(num);
+#else
+	return pg_ceil_log2_64(num);
+#endif
 }
 
 /* calculate first power of 2 >= num, bounded to what will fit in a long */

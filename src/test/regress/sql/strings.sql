@@ -21,13 +21,34 @@ SET standard_conforming_strings TO on;
 
 SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
 SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
+SELECT U&'a\\b' AS "a\b";
 
 SELECT U&' \' UESCAPE '!' AS "tricky";
 SELECT 'tricky' AS U&"\" UESCAPE '!';
 
 SELECT U&'wrong: \061';
 SELECT U&'wrong: \+0061';
+SELECT U&'wrong: +0061' UESCAPE +;
 SELECT U&'wrong: +0061' UESCAPE '+';
+
+SELECT U&'wrong: \db99';
+SELECT U&'wrong: \db99xy';
+SELECT U&'wrong: \db99\\';
+SELECT U&'wrong: \db99\0061';
+SELECT U&'wrong: \+00db99\+000061';
+SELECT U&'wrong: \+2FFFFF';
+
+-- while we're here, check the same cases in E-style literals
+SELECT E'd\u0061t\U00000061' AS "data";
+SELECT E'a\\b' AS "a\b";
+SELECT E'wrong: \u061';
+SELECT E'wrong: \U0061';
+SELECT E'wrong: \udb99';
+SELECT E'wrong: \udb99xy';
+SELECT E'wrong: \udb99\\';
+SELECT E'wrong: \udb99\u0061';
+SELECT E'wrong: \U0000db99\U00000061';
+SELECT E'wrong: \U002FFFFF';
 
 SET standard_conforming_strings TO off;
 
@@ -111,31 +132,33 @@ SELECT SUBSTRING('1234567890' FROM 3) = '34567890' AS "34567890";
 SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
 
 -- T581 regular expression substring (with SQL's bizarre regexp syntax)
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"(b_d)#"%' ESCAPE '#') AS "bcd";
+-- obsolete SQL99 syntax
 SELECT SUBSTRING('abcdefg' FROM 'a#"(b_d)#"%' FOR '#') AS "bcd";
 
 -- No match should return NULL
-SELECT SUBSTRING('abcdefg' FROM '#"(b_d)#"%' FOR '#') IS NULL AS "True";
+SELECT SUBSTRING('abcdefg' SIMILAR '#"(b_d)#"%' ESCAPE '#') IS NULL AS "True";
 
 -- Null inputs should return NULL
-SELECT SUBSTRING('abcdefg' FROM '%' FOR NULL) IS NULL AS "True";
-SELECT SUBSTRING(NULL FROM '%' FOR '#') IS NULL AS "True";
-SELECT SUBSTRING('abcdefg' FROM NULL FOR '#') IS NULL AS "True";
+SELECT SUBSTRING('abcdefg' SIMILAR '%' ESCAPE NULL) IS NULL AS "True";
+SELECT SUBSTRING(NULL SIMILAR '%' ESCAPE '#') IS NULL AS "True";
+SELECT SUBSTRING('abcdefg' SIMILAR NULL ESCAPE '#') IS NULL AS "True";
 
 -- The first and last parts should act non-greedy
-SELECT SUBSTRING('abcdefg' FROM 'a#"%#"g' FOR '#') AS "bcdef";
-SELECT SUBSTRING('abcdefg' FROM 'a*#"%#"g*' FOR '#') AS "abcdefg";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%#"g' ESCAPE '#') AS "bcdef";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a*#"%#"g*' ESCAPE '#') AS "abcdefg";
 
 -- Vertical bar in any part affects only that part
-SELECT SUBSTRING('abcdefg' FROM 'a|b#"%#"g' FOR '#') AS "bcdef";
-SELECT SUBSTRING('abcdefg' FROM 'a#"%#"x|g' FOR '#') AS "bcdef";
-SELECT SUBSTRING('abcdefg' FROM 'a#"%|ab#"g' FOR '#') AS "bcdef";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a|b#"%#"g' ESCAPE '#') AS "bcdef";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%#"x|g' ESCAPE '#') AS "bcdef";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%|ab#"g' ESCAPE '#') AS "bcdef";
 
 -- Can't have more than two part separators
-SELECT SUBSTRING('abcdefg' FROM 'a*#"%#"g*#"x' FOR '#') AS "error";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a*#"%#"g*#"x' ESCAPE '#') AS "error";
 
 -- Postgres extension: with 0 or 1 separator, assume parts 1 and 3 are empty
-SELECT SUBSTRING('abcdefg' FROM 'a#"%g' FOR '#') AS "bcdefg";
-SELECT SUBSTRING('abcdefg' FROM 'a%g' FOR '#') AS "abcdefg";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%g' ESCAPE '#') AS "bcdefg";
+SELECT SUBSTRING('abcdefg' SIMILAR 'a%g' ESCAPE '#') AS "abcdefg";
 
 -- substring() with just two arguments is not allowed by SQL spec;
 -- we accept it, but we interpret the pattern as a POSIX regexp not SQL
@@ -510,7 +533,23 @@ SELECT replace('yabadoo', 'bad', '') AS "yaoo";
 --
 -- test split_part
 --
+select split_part('','@',1) AS "empty string";
+
+select split_part('','@',-1) AS "empty string";
+
+select split_part('joeuser@mydatabase','',1) AS "joeuser@mydatabase";
+
+select split_part('joeuser@mydatabase','',2) AS "empty string";
+
+select split_part('joeuser@mydatabase','',-1) AS "joeuser@mydatabase";
+
+select split_part('joeuser@mydatabase','',-2) AS "empty string";
+
 select split_part('joeuser@mydatabase','@',0) AS "an error";
+
+select split_part('joeuser@mydatabase','@@',1) AS "joeuser@mydatabase";
+
+select split_part('joeuser@mydatabase','@@',2) AS "empty string";
 
 select split_part('joeuser@mydatabase','@',1) AS "joeuser";
 
@@ -519,6 +558,14 @@ select split_part('joeuser@mydatabase','@',2) AS "mydatabase";
 select split_part('joeuser@mydatabase','@',3) AS "empty string";
 
 select split_part('@joeuser@mydatabase@','@',2) AS "joeuser";
+
+select split_part('joeuser@mydatabase','@',-1) AS "mydatabase";
+
+select split_part('joeuser@mydatabase','@',-2) AS "joeuser";
+
+select split_part('joeuser@mydatabase','@',-3) AS "empty string";
+
+select split_part('@joeuser@mydatabase@','@',-2) AS "mydatabase";
 
 --
 -- test to_hex
@@ -575,6 +622,29 @@ SELECT sha384('The quick brown fox jumps over the lazy dog.');
 
 SELECT sha512('');
 SELECT sha512('The quick brown fox jumps over the lazy dog.');
+
+--
+-- encode/decode
+--
+SELECT encode('\x1234567890abcdef00', 'hex');
+SELECT decode('1234567890abcdef00', 'hex');
+SELECT encode(('\x' || repeat('1234567890abcdef0001', 7))::bytea, 'base64');
+SELECT decode(encode(('\x' || repeat('1234567890abcdef0001', 7))::bytea,
+                     'base64'), 'base64');
+SELECT encode('\x1234567890abcdef00', 'escape');
+SELECT decode(encode('\x1234567890abcdef00', 'escape'), 'escape');
+
+--
+-- get_bit/set_bit etc
+--
+SELECT get_bit('\x1234567890abcdef00'::bytea, 43);
+SELECT get_bit('\x1234567890abcdef00'::bytea, 99);  -- error
+SELECT set_bit('\x1234567890abcdef00'::bytea, 43, 0);
+SELECT set_bit('\x1234567890abcdef00'::bytea, 99, 0);  -- error
+SELECT get_byte('\x1234567890abcdef00'::bytea, 3);
+SELECT get_byte('\x1234567890abcdef00'::bytea, 99);  -- error
+SELECT set_byte('\x1234567890abcdef00'::bytea, 7, 11);
+SELECT set_byte('\x1234567890abcdef00'::bytea, 99, 11);  -- error
 
 --
 -- test behavior of escape_string_warning and standard_conforming_strings options

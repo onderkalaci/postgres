@@ -318,6 +318,21 @@ CREATE TABLE default_expr_agg (a int DEFAULT (select 1));
 -- invalid use of set-returning function
 CREATE TABLE default_expr_agg (a int DEFAULT (generate_series(1,3)));
 
+-- Verify that subtransaction rollback restores rd_createSubid.
+BEGIN;
+CREATE TABLE remember_create_subid (c int);
+SAVEPOINT q; DROP TABLE remember_create_subid; ROLLBACK TO q;
+COMMIT;
+DROP TABLE remember_create_subid;
+
+-- Verify that subtransaction rollback restores rd_firstRelfilenodeSubid.
+CREATE TABLE remember_node_subid (c int);
+BEGIN;
+ALTER TABLE remember_node_subid ALTER c TYPE bigint;
+SAVEPOINT q; DROP TABLE remember_node_subid; ROLLBACK TO q;
+COMMIT;
+DROP TABLE remember_node_subid;
+
 --
 -- Partitioned tables
 --
@@ -361,7 +376,7 @@ CREATE TABLE partitioned (
 
 CREATE TABLE partitioned (
 	a int
-) PARTITION BY RANGE (('a'));
+) PARTITION BY RANGE ((42));
 
 CREATE FUNCTION const_func () RETURNS int AS $$ SELECT 1; $$ LANGUAGE SQL IMMUTABLE;
 CREATE TABLE partitioned (
@@ -384,17 +399,22 @@ CREATE TABLE partitioned (
 	a int
 ) PARTITION BY RANGE (xmin);
 
+-- cannot use pseudotypes
+CREATE TABLE partitioned (
+	a int,
+	b int
+) PARTITION BY RANGE (((a, b)));
+CREATE TABLE partitioned (
+	a int,
+	b int
+) PARTITION BY RANGE (a, ('unknown'));
+
 -- functions in key must be immutable
 CREATE FUNCTION immut_func (a int) RETURNS int AS $$ SELECT a + random()::int; $$ LANGUAGE SQL;
 CREATE TABLE partitioned (
 	a int
 ) PARTITION BY RANGE (immut_func(a));
 DROP FUNCTION immut_func(int);
-
--- cannot contain whole-row references
-CREATE TABLE partitioned (
-	a	int
-) PARTITION BY RANGE ((partitioned));
 
 -- prevent using columns of unsupported types in key (type must have a btree operator class)
 CREATE TABLE partitioned (
@@ -448,6 +468,29 @@ CREATE TABLE part2_1 PARTITION OF partitioned2 FOR VALUES FROM (-1, 'aaaaa') TO 
 \d+ part2_1
 
 DROP TABLE partitioned, partitioned2;
+
+-- check reference to partitioned table's rowtype in partition descriptor
+create table partitioned (a int, b int)
+  partition by list ((row(a, b)::partitioned));
+create table partitioned1
+  partition of partitioned for values in ('(1,2)'::partitioned);
+create table partitioned2
+  partition of partitioned for values in ('(2,4)'::partitioned);
+explain (costs off)
+select * from partitioned where row(a,b)::partitioned = '(1,2)'::partitioned;
+drop table partitioned;
+
+-- whole-row Var in partition key works too
+create table partitioned (a int, b int)
+  partition by list ((partitioned));
+create table partitioned1
+  partition of partitioned for values in ('(1,2)');
+create table partitioned2
+  partition of partitioned for values in ('(2,4)');
+explain (costs off)
+select * from partitioned where partitioned = '(1,2)'::partitioned;
+\d+ partitioned1
+drop table partitioned;
 
 -- check that dependencies of partition columns are handled correctly
 create domain intdom1 as int;
@@ -506,6 +549,7 @@ CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(so
 CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (sum(1));
 CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((select 1));
 CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN (generate_series(4, 6));
+CREATE TABLE part_bogus_expr_fail PARTITION OF list_parted FOR VALUES IN ((1+1) collate "POSIX");
 
 -- syntax does not allow empty list of values for list partitions
 CREATE TABLE fail_part PARTITION OF list_parted FOR VALUES IN ();
@@ -643,6 +687,7 @@ CREATE TABLE fail_part PARTITION OF range_parted2 FOR VALUES FROM (1) TO (1);
 CREATE TABLE part0 PARTITION OF range_parted2 FOR VALUES FROM (minvalue) TO (1);
 CREATE TABLE fail_part PARTITION OF range_parted2 FOR VALUES FROM (minvalue) TO (2);
 CREATE TABLE part1 PARTITION OF range_parted2 FOR VALUES FROM (1) TO (10);
+CREATE TABLE fail_part PARTITION OF range_parted2 FOR VALUES FROM (-1) TO (1);
 CREATE TABLE fail_part PARTITION OF range_parted2 FOR VALUES FROM (9) TO (maxvalue);
 CREATE TABLE part2 PARTITION OF range_parted2 FOR VALUES FROM (20) TO (30);
 CREATE TABLE part3 PARTITION OF range_parted2 FOR VALUES FROM (30) TO (40);
@@ -757,6 +802,14 @@ insert into parted_notnull_inh_test (b) values (null);
 \d parted_notnull_inh_test1
 drop table parted_notnull_inh_test;
 
+-- check that collations are assigned in partition bound expressions
+create table parted_boolean_col (a bool, b text) partition by list(a);
+create table parted_boolean_less partition of parted_boolean_col
+  for values in ('foo' < 'bar');
+create table parted_boolean_greater partition of parted_boolean_col
+  for values in ('foo' > 'bar');
+drop table parted_boolean_col;
+
 -- check for a conflicting COLLATE clause
 create table parted_collate_must_match (a text collate "C", b text collate "C")
   partition by range (a);
@@ -768,23 +821,16 @@ create table parted_collate_must_match2 partition of parted_collate_must_match
   (b collate "POSIX") for values from ('m') to ('z');
 drop table parted_collate_must_match;
 
--- check that specifying incompatible collations for partition bound
--- expressions fails promptly
+-- check that non-matching collations for partition bound
+-- expressions are coerced to the right collation
 
 create table test_part_coll_posix (a text) partition by range (a collate "POSIX");
--- fail
+-- ok, collation is implicitly coerced
 create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "C") to ('g');
 -- ok
-create table test_part_coll partition of test_part_coll_posix for values from ('a' collate "POSIX") to ('g');
--- ok
 create table test_part_coll2 partition of test_part_coll_posix for values from ('g') to ('m');
-
--- using a cast expression uses the target type's default collation
-
--- fail
+-- ok, collation is implicitly coerced
 create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "C") to ('s');
--- ok
-create table test_part_coll_cast partition of test_part_coll_posix for values from (name 'm' collate "POSIX") to ('s');
 -- ok; partition collation silently overrides the default collation of type 'name'
 create table test_part_coll_cast2 partition of test_part_coll_posix for values from (name 's') to ('z');
 

@@ -3,7 +3,7 @@ use warnings;
 
 use PostgresNode;
 use TestLib;
-use Test::More tests => 4;
+use Test::More tests => 5;
 use Time::HiRes qw(usleep);
 
 # Set up node with logging collector
@@ -21,7 +21,19 @@ $node->start();
 
 $node->psql('postgres', 'SELECT 1/0');
 
-my $current_logfiles = slurp_file($node->data_dir . '/current_logfiles');
+# might need to retry if logging collector process is slow...
+my $max_attempts = 180 * 10;
+
+my $current_logfiles;
+for (my $attempts = 0; $attempts < $max_attempts; $attempts++)
+{
+	eval {
+		$current_logfiles = slurp_file($node->data_dir . '/current_logfiles');
+	};
+	last unless $@;
+	usleep(100_000);
+}
+die $@ if $@;
 
 note "current_logfiles = $current_logfiles";
 
@@ -34,9 +46,6 @@ my $lfname = $current_logfiles;
 $lfname =~ s/^stderr //;
 chomp $lfname;
 
-# might need to retry if logging collector process is slow...
-my $max_attempts = 180 * 10;
-
 my $first_logfile;
 for (my $attempts = 0; $attempts < $max_attempts; $attempts++)
 {
@@ -46,6 +55,10 @@ for (my $attempts = 0; $attempts < $max_attempts; $attempts++)
 }
 
 like($first_logfile, qr/division by zero/, 'found expected log file content');
+
+# While we're at it, test pg_current_logfile() function
+is($node->safe_psql('postgres', "SELECT pg_current_logfile('stderr')"),
+	$lfname, 'pg_current_logfile() gives correct answer');
 
 # Sleep 2 seconds and ask for log rotation; this should result in
 # output into a different log file name.

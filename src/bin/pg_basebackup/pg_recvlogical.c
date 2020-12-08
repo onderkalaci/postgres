@@ -3,7 +3,7 @@
  * pg_recvlogical.c - receive data from a logical decoding slot in a streaming
  *					  fashion and write it to a local file.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_recvlogical.c
@@ -103,7 +103,8 @@ usage(void)
 	printf(_("  -U, --username=NAME    connect as specified database user\n"));
 	printf(_("  -w, --no-password      never prompt for password\n"));
 	printf(_("  -W, --password         force password prompt (should happen automatically)\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
 /*
@@ -125,7 +126,7 @@ sendFeedback(PGconn *conn, TimestampTz now, bool force, bool replyRequested)
 	 */
 	if (!force &&
 		last_written_lsn == output_written_lsn &&
-		last_fsync_lsn != output_fsync_lsn)
+		last_fsync_lsn == output_fsync_lsn)
 		return true;
 
 	if (verbose)
@@ -285,7 +286,7 @@ StreamLogicalLog(void)
 		}
 
 		/*
-		 * Potentially send a status message to the master
+		 * Potentially send a status message to the primary.
 		 */
 		now = feGetCurrentTimestamp();
 
@@ -579,14 +580,40 @@ StreamLogicalLog(void)
 	res = PQgetResult(conn);
 	if (PQresultStatus(res) == PGRES_COPY_OUT)
 	{
+		PQclear(res);
+
 		/*
 		 * We're doing a client-initiated clean exit and have sent CopyDone to
-		 * the server. We've already sent replay confirmation and fsync'd so
-		 * we can just clean up the connection now.
+		 * the server. Drain any messages, so we don't miss a last-minute
+		 * ErrorResponse. The walsender stops generating XLogData records once
+		 * it sees CopyDone, so expect this to finish quickly. After CopyDone,
+		 * it's too late for sendFeedback(), even if this were to take a long
+		 * time. Hence, use synchronous-mode PQgetCopyData().
 		 */
-		goto error;
+		while (1)
+		{
+			int			r;
+
+			if (copybuf != NULL)
+			{
+				PQfreemem(copybuf);
+				copybuf = NULL;
+			}
+			r = PQgetCopyData(conn, &copybuf, 0);
+			if (r == -1)
+				break;
+			if (r == -2)
+			{
+				pg_log_error("could not read COPY data: %s",
+							 PQerrorMessage(conn));
+				time_to_abort = false;	/* unclean exit */
+				goto error;
+			}
+		}
+
+		res = PQgetResult(conn);
 	}
-	else if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		pg_log_error("unexpected termination of replication stream: %s",
 					 PQresultErrorMessage(res));

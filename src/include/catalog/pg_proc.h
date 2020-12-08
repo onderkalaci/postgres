@@ -3,7 +3,7 @@
  * pg_proc.h
  *	  definition of the "procedure" system catalog (pg_proc)
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_proc.h
@@ -91,8 +91,8 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	 * proargtypes
 	 */
 
-	/* parameter types (excludes OUT params) */
-	oidvector	proargtypes BKI_LOOKUP(pg_type);
+	/* parameter types (excludes OUT params of functions) */
+	oidvector	proargtypes BKI_LOOKUP(pg_type) BKI_FORCE_NOT_NULL;
 
 #ifdef CATALOG_VARLEN
 
@@ -132,6 +132,13 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
  */
 typedef FormData_pg_proc *Form_pg_proc;
 
+DECLARE_TOAST(pg_proc, 2836, 2837);
+
+DECLARE_UNIQUE_INDEX(pg_proc_oid_index, 2690, on pg_proc using btree(oid oid_ops));
+#define ProcedureOidIndexId  2690
+DECLARE_UNIQUE_INDEX(pg_proc_proname_args_nsp_index, 2691, on pg_proc using btree(proname name_ops, proargtypes oidvector_ops, pronamespace oid_ops));
+#define ProcedureNameArgsNspIndexId  2691
+
 #ifdef EXPOSE_TO_CLIENT_CODE
 
 /*
@@ -157,10 +164,10 @@ typedef FormData_pg_proc *Form_pg_proc;
 /*
  * Symbolic values for proparallel column: these indicate whether a function
  * can be safely be run in a parallel backend, during parallelism but
- * necessarily in the master, or only in non-parallel mode.
+ * necessarily in the leader, or only in non-parallel mode.
  */
-#define PROPARALLEL_SAFE		's' /* can run in worker or master */
-#define PROPARALLEL_RESTRICTED	'r' /* can run in parallel master only */
+#define PROPARALLEL_SAFE		's' /* can run in worker or leader */
+#define PROPARALLEL_RESTRICTED	'r' /* can run in parallel leader only */
 #define PROPARALLEL_UNSAFE		'u' /* banned while in parallel mode */
 
 /*

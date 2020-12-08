@@ -4,7 +4,7 @@
  *	  POSTGRES multivariate MCV lists
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -32,6 +32,7 @@
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -210,8 +211,8 @@ statext_mcv_build(int numrows, HeapTuple *rows, Bitmapset *attrs,
 	groups = build_distinct_groups(nitems, items, mss, &ngroups);
 
 	/*
-	 * Maximum number of MCV items to store, based on the statistics target
-	 * we computed for the statistics object (from target set for the object
+	 * Maximum number of MCV items to store, based on the statistics target we
+	 * computed for the statistics object (from target set for the object
 	 * itself, attributes and the system default). In any case, we can't keep
 	 * more groups than we have available.
 	 */
@@ -261,7 +262,7 @@ statext_mcv_build(int numrows, HeapTuple *rows, Bitmapset *attrs,
 	{
 		int			j;
 		SortItem	key;
-		MultiSortSupport	tmp;
+		MultiSortSupport tmp;
 
 		/* frequencies for values in each attribute */
 		SortItem  **freqs;
@@ -463,7 +464,7 @@ build_distinct_groups(int numrows, SortItem *items, MultiSortSupport mss,
 static int
 sort_item_compare(const void *a, const void *b, void *arg)
 {
-	SortSupport	ssup = (SortSupport) arg;
+	SortSupport ssup = (SortSupport) arg;
 	SortItem   *ia = (SortItem *) a;
 	SortItem   *ib = (SortItem *) b;
 
@@ -499,7 +500,7 @@ build_column_frequencies(SortItem *groups, int ngroups,
 
 	/* allocate arrays for all columns as a single chunk */
 	ptr = palloc(MAXALIGN(sizeof(SortItem *) * mss->ndims) +
-		  mss->ndims * MAXALIGN(sizeof(SortItem) * ngroups));
+				 mss->ndims * MAXALIGN(sizeof(SortItem) * ngroups));
 
 	/* initial array of pointers */
 	result = (SortItem **) ptr;
@@ -507,7 +508,7 @@ build_column_frequencies(SortItem *groups, int ngroups,
 
 	for (dim = 0; dim < mss->ndims; dim++)
 	{
-		SortSupport	ssup = &mss->ssup[dim];
+		SortSupport ssup = &mss->ssup[dim];
 
 		/* array of values for a single column */
 		result[dim] = (SortItem *) ptr;
@@ -528,15 +529,15 @@ build_column_frequencies(SortItem *groups, int ngroups,
 
 		/*
 		 * Identify distinct values, compute frequency (there might be
-		 * multiple MCV items containing this value, so we need to sum
-		 * counts from all of them.
+		 * multiple MCV items containing this value, so we need to sum counts
+		 * from all of them.
 		 */
 		ncounts[dim] = 1;
 		for (i = 1; i < ngroups; i++)
 		{
-			if (sort_item_compare(&result[dim][i-1], &result[dim][i], ssup) == 0)
+			if (sort_item_compare(&result[dim][i - 1], &result[dim][i], ssup) == 0)
 			{
-				result[dim][ncounts[dim]-1].count += result[dim][i].count;
+				result[dim][ncounts[dim] - 1].count += result[dim][i].count;
 				continue;
 			}
 
@@ -723,23 +724,23 @@ statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
 		 */
 		info[dim].nvalues = ndistinct;
 
-		if (info[dim].typbyval)	/* by-value data types */
+		if (info[dim].typbyval) /* by-value data types */
 		{
 			info[dim].nbytes = info[dim].nvalues * info[dim].typlen;
 
 			/*
 			 * We copy the data into the MCV item during deserialization, so
 			 * we don't need to allocate any extra space.
-			*/
+			 */
 			info[dim].nbytes_aligned = 0;
 		}
-		else if (info[dim].typlen > 0)		/* fixed-length by-ref */
+		else if (info[dim].typlen > 0)	/* fixed-length by-ref */
 		{
 			/*
 			 * We don't care about alignment in the serialized data, so we
 			 * pack the data as much as possible. But we also track how much
-			 * data will be needed after deserialization, and in that case
-			 * we need to account for alignment of each item.
+			 * data will be needed after deserialization, and in that case we
+			 * need to account for alignment of each item.
 			 *
 			 * Note: As the items are fixed-length, we could easily compute
 			 * this during deserialization, but we do it here anyway.
@@ -765,8 +766,8 @@ statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
 
 				/* serialized length (uint32 length + data) */
 				len = VARSIZE_ANY_EXHDR(values[dim][i]);
-				info[dim].nbytes += sizeof(uint32);	/* length */
-				info[dim].nbytes += len;			/* value (no header) */
+				info[dim].nbytes += sizeof(uint32); /* length */
+				info[dim].nbytes += len;	/* value (no header) */
 
 				/*
 				 * During deserialization we'll build regular varlena values
@@ -792,8 +793,8 @@ statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
 
 				/* c-strings include terminator, so +1 byte */
 				len = strlen(DatumGetCString(values[dim][i])) + 1;
-				info[dim].nbytes += sizeof(uint32);	/* length */
-				info[dim].nbytes += len;			/* value */
+				info[dim].nbytes += sizeof(uint32); /* length */
+				info[dim].nbytes += len;	/* value */
 
 				/* space needed for properly aligned deserialized copies */
 				info[dim].nbytes_aligned += MAXALIGN(len);
@@ -809,9 +810,9 @@ statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
 	 * whole serialized MCV list (varlena header, MCV header, dimension info
 	 * for each attribute, deduplicated values and items).
 	 */
-	total_length = (3 * sizeof(uint32))			/* magic + type + nitems */
-					+ sizeof(AttrNumber)		/* ndimensions */
-					+ (ndims * sizeof(Oid));	/* attribute types */
+	total_length = (3 * sizeof(uint32)) /* magic + type + nitems */
+		+ sizeof(AttrNumber)	/* ndimensions */
+		+ (ndims * sizeof(Oid));	/* attribute types */
 
 	/* dimension info */
 	total_length += ndims * sizeof(DimensionInfo);
@@ -954,7 +955,8 @@ statext_mcv_serialize(MCVList *mcvlist, VacAttrStats **stats)
 											  info[dim].nvalues, sizeof(Datum),
 											  compare_scalars_simple, &ssup[dim]);
 
-				Assert(value != NULL);	/* serialization or deduplication error */
+				Assert(value != NULL);	/* serialization or deduplication
+										 * error */
 
 				/* compute index within the deduplicated array */
 				index = (uint16) (value - values[dim]);
@@ -1147,8 +1149,8 @@ statext_mcv_deserialize(bytea *data)
 	 * serialized data - it's not aligned properly, and it may disappear while
 	 * we're still using the MCV list, e.g. due to catcache release.
 	 *
-	 * We do care about alignment here, because we will allocate all the pieces
-	 * at once, but then use pointers to different parts.
+	 * We do care about alignment here, because we will allocate all the
+	 * pieces at once, but then use pointers to different parts.
 	 */
 	mcvlen = MAXALIGN(offsetof(MCVList, items) + (sizeof(MCVItem) * nitems));
 
@@ -1291,7 +1293,7 @@ statext_mcv_deserialize(bytea *data)
 		/* finally translate the indexes (for non-NULL only) */
 		for (dim = 0; dim < ndims; dim++)
 		{
-			uint16	index;
+			uint16		index;
 
 			memcpy(&index, ptr, sizeof(uint16));
 			ptr += sizeof(uint16);
@@ -1377,7 +1379,8 @@ pg_stats_ext_mcvlist_items(PG_FUNCTION_ARGS)
 	/* stuff done on every call of the function */
 	funcctx = SRF_PERCALL_SETUP();
 
-	if (funcctx->call_cntr < funcctx->max_calls)	/* do when there is more left to send */
+	if (funcctx->call_cntr < funcctx->max_calls)	/* do when there is more
+													 * left to send */
 	{
 		Datum		values[5];
 		bool		nulls[5];
@@ -1400,10 +1403,10 @@ pg_stats_ext_mcvlist_items(PG_FUNCTION_ARGS)
 		{
 
 			astate_nulls = accumArrayResult(astate_nulls,
-								  BoolGetDatum(item->isnull[i]),
-								  false,
-								  BOOLOID,
-								  CurrentMemoryContext);
+											BoolGetDatum(item->isnull[i]),
+											false,
+											BOOLOID,
+											CurrentMemoryContext);
 
 			if (!item->isnull[i])
 			{
@@ -1421,17 +1424,17 @@ pg_stats_ext_mcvlist_items(PG_FUNCTION_ARGS)
 				txt = cstring_to_text(DatumGetPointer(val));
 
 				astate_values = accumArrayResult(astate_values,
-								  PointerGetDatum(txt),
-								  false,
-								  TEXTOID,
-								  CurrentMemoryContext);
+												 PointerGetDatum(txt),
+												 false,
+												 TEXTOID,
+												 CurrentMemoryContext);
 			}
 			else
 				astate_values = accumArrayResult(astate_values,
-								  (Datum) 0,
-								  true,
-								  TEXTOID,
-								  CurrentMemoryContext);
+												 (Datum) 0,
+												 true,
+												 TEXTOID,
+												 CurrentMemoryContext);
 		}
 
 		values[0] = Int32GetDatum(funcctx->call_cntr);
@@ -1579,7 +1582,7 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 			OpExpr	   *expr = (OpExpr *) clause;
 			FmgrInfo	opproc;
 
-			/* valid only after examine_opclause_expression returns true */
+			/* valid only after examine_clause_args returns true */
 			Var		   *var;
 			Const	   *cst;
 			bool		varonleft;
@@ -1587,7 +1590,7 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 			fmgr_info(get_opcode(expr->opno), &opproc);
 
 			/* extract the var and const from the expression */
-			if (examine_opclause_expression(expr, &var, &cst, &varonleft))
+			if (examine_clause_args(expr->args, &var, &cst, &varonleft))
 			{
 				int			idx;
 
@@ -1606,9 +1609,9 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 					MCVItem    *item = &mcvlist->items[i];
 
 					/*
-					 * When the MCV item or the Const value is NULL we can treat
-					 * this as a mismatch. We must not call the operator because
-					 * of strictness.
+					 * When the MCV item or the Const value is NULL we can
+					 * treat this as a mismatch. We must not call the operator
+					 * because of strictness.
 					 */
 					if (item->isnull[idx] || cst->constisnull)
 					{
@@ -1631,10 +1634,10 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 					 *
 					 * We don't store collations used to build the statistics,
 					 * but we can use the collation for the attribute itself,
-					 * as stored in varcollid. We do reset the statistics after
-					 * a type change (including collation change), so this is
-					 * OK. We may need to relax this after allowing extended
-					 * statistics on expressions.
+					 * as stored in varcollid. We do reset the statistics
+					 * after a type change (including collation change), so
+					 * this is OK. We may need to relax this after allowing
+					 * extended statistics on expressions.
 					 */
 					if (varonleft)
 						match = DatumGetBool(FunctionCall2Coll(&opproc,
@@ -1646,6 +1649,113 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 															   var->varcollid,
 															   cst->constvalue,
 															   item->values[idx]));
+
+					/* update the match bitmap with the result */
+					matches[i] = RESULT_MERGE(matches[i], is_or, match);
+				}
+			}
+		}
+		else if (IsA(clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) clause;
+			FmgrInfo	opproc;
+
+			/* valid only after examine_clause_args returns true */
+			Var		   *var;
+			Const	   *cst;
+			bool		varonleft;
+
+			fmgr_info(get_opcode(expr->opno), &opproc);
+
+			/* extract the var and const from the expression */
+			if (examine_clause_args(expr->args, &var, &cst, &varonleft))
+			{
+				int			idx;
+
+				ArrayType  *arrayval;
+				int16		elmlen;
+				bool		elmbyval;
+				char		elmalign;
+				int			num_elems;
+				Datum	   *elem_values;
+				bool	   *elem_nulls;
+
+				/* ScalarArrayOpExpr has the Var always on the left */
+				Assert(varonleft);
+
+				if (!cst->constisnull)
+				{
+					arrayval = DatumGetArrayTypeP(cst->constvalue);
+					get_typlenbyvalalign(ARR_ELEMTYPE(arrayval),
+										 &elmlen, &elmbyval, &elmalign);
+					deconstruct_array(arrayval,
+									  ARR_ELEMTYPE(arrayval),
+									  elmlen, elmbyval, elmalign,
+									  &elem_values, &elem_nulls, &num_elems);
+				}
+
+				/* match the attribute to a dimension of the statistic */
+				idx = bms_member_index(keys, var->varattno);
+
+				/*
+				 * Walk through the MCV items and evaluate the current clause.
+				 * We can skip items that were already ruled out, and
+				 * terminate if there are no remaining MCV items that might
+				 * possibly match.
+				 */
+				for (i = 0; i < mcvlist->nitems; i++)
+				{
+					int			j;
+					bool		match = (expr->useOr ? false : true);
+					MCVItem    *item = &mcvlist->items[i];
+
+					/*
+					 * When the MCV item or the Const value is NULL we can
+					 * treat this as a mismatch. We must not call the operator
+					 * because of strictness.
+					 */
+					if (item->isnull[idx] || cst->constisnull)
+					{
+						matches[i] = RESULT_MERGE(matches[i], is_or, false);
+						continue;
+					}
+
+					/*
+					 * Skip MCV items that can't change result in the bitmap.
+					 * Once the value gets false for AND-lists, or true for
+					 * OR-lists, we don't need to look at more clauses.
+					 */
+					if (RESULT_IS_FINAL(matches[i], is_or))
+						continue;
+
+					for (j = 0; j < num_elems; j++)
+					{
+						Datum		elem_value = elem_values[j];
+						bool		elem_isnull = elem_nulls[j];
+						bool		elem_match;
+
+						/* NULL values always evaluate as not matching. */
+						if (elem_isnull)
+						{
+							match = RESULT_MERGE(match, expr->useOr, false);
+							continue;
+						}
+
+						/*
+						 * Stop evaluating the array elements once we reach
+						 * match value that can't change - ALL() is the same
+						 * as AND-list, ANY() is the same as OR-list.
+						 */
+						if (RESULT_IS_FINAL(match, expr->useOr))
+							break;
+
+						elem_match = DatumGetBool(FunctionCall2Coll(&opproc,
+																	var->varcollid,
+																	item->values[idx],
+																	elem_value));
+
+						match = RESULT_MERGE(match, expr->useOr, elem_match);
+					}
 
 					/* update the match bitmap with the result */
 					matches[i] = RESULT_MERGE(matches[i], is_or, match);
@@ -1780,15 +1890,79 @@ mcv_get_match_bitmap(PlannerInfo *root, List *clauses,
 
 
 /*
+ * mcv_combine_selectivities
+ * 		Combine per-column and multi-column MCV selectivity estimates.
+ *
+ * simple_sel is a "simple" selectivity estimate (produced without using any
+ * extended statistics, essentially assuming independence of columns/clauses).
+ *
+ * mcv_sel and mcv_basesel are sums of the frequencies and base frequencies of
+ * all matching MCV items.  The difference (mcv_sel - mcv_basesel) is then
+ * essentially interpreted as a correction to be added to simple_sel, as
+ * described below.
+ *
+ * mcv_totalsel is the sum of the frequencies of all MCV items (not just the
+ * matching ones).  This is used as an upper bound on the portion of the
+ * selectivity estimates not covered by the MCV statistics.
+ *
+ * Note: While simple and base selectivities are defined in a quite similar
+ * way, the values are computed differently and are not therefore equal. The
+ * simple selectivity is computed as a product of per-clause estimates, while
+ * the base selectivity is computed by adding up base frequencies of matching
+ * items of the multi-column MCV list. So the values may differ for two main
+ * reasons - (a) the MCV list may not cover 100% of the data and (b) some of
+ * the MCV items did not match the estimated clauses.
+ *
+ * As both (a) and (b) reduce the base selectivity value, it generally holds
+ * that (simple_sel >= mcv_basesel). If the MCV list covers all the data, the
+ * values may be equal.
+ *
+ * So, other_sel = (simple_sel - mcv_basesel) is an estimate for the part not
+ * covered by the MCV list, and (mcv_sel - mcv_basesel) may be seen as a
+ * correction for the part covered by the MCV list. Those two statements are
+ * actually equivalent.
+ */
+Selectivity
+mcv_combine_selectivities(Selectivity simple_sel,
+						  Selectivity mcv_sel,
+						  Selectivity mcv_basesel,
+						  Selectivity mcv_totalsel)
+{
+	Selectivity other_sel;
+	Selectivity sel;
+
+	/* estimated selectivity of values not covered by MCV matches */
+	other_sel = simple_sel - mcv_basesel;
+	CLAMP_PROBABILITY(other_sel);
+
+	/* this non-MCV selectivity cannot exceed 1 - mcv_totalsel */
+	if (other_sel > 1.0 - mcv_totalsel)
+		other_sel = 1.0 - mcv_totalsel;
+
+	/* overall selectivity is the sum of the MCV and non-MCV parts */
+	sel = mcv_sel + other_sel;
+	CLAMP_PROBABILITY(sel);
+
+	return sel;
+}
+
+
+/*
  * mcv_clauselist_selectivity
- *		Return the selectivity estimate computed using an MCV list.
+ *		Use MCV statistics to estimate the selectivity of an implicitly-ANDed
+ *		list of clauses.
  *
- * First builds a bitmap of MCV items matching the clauses, and then sums
- * the frequencies of matching items.
+ * This determines which MCV items match every clause in the list and returns
+ * the sum of the frequencies of those items.
  *
- * It also produces two additional interesting selectivities - total
- * selectivity of all the MCV items (not just the matching ones), and the
- * base frequency computed on the assumption of independence.
+ * In addition, it returns the sum of the base frequencies of each of those
+ * items (that is the sum of the selectivities that each item would have if
+ * the columns were independent of one another), and the total selectivity of
+ * all the MCV items (not just the matching ones).  These are expected to be
+ * used together with a "simple" selectivity estimate (one based only on
+ * per-column statistics) to produce an overall selectivity estimate that
+ * makes use of both per-column and multi-column statistics --- see
+ * mcv_combine_selectivities().
  */
 Selectivity
 mcv_clauselist_selectivity(PlannerInfo *root, StatisticExtInfo *stat,
@@ -1819,11 +1993,101 @@ mcv_clauselist_selectivity(PlannerInfo *root, StatisticExtInfo *stat,
 
 		if (matches[i] != false)
 		{
-			/* XXX Shouldn't the basesel be outside the if condition? */
 			*basesel += mcv->items[i].base_frequency;
 			s += mcv->items[i].frequency;
 		}
 	}
+
+	return s;
+}
+
+
+/*
+ * mcv_clause_selectivity_or
+ *		Use MCV statistics to estimate the selectivity of a clause that
+ *		appears in an ORed list of clauses.
+ *
+ * As with mcv_clauselist_selectivity() this determines which MCV items match
+ * the clause and returns both the sum of the frequencies and the sum of the
+ * base frequencies of those items, as well as the sum of the frequencies of
+ * all MCV items (not just the matching ones) so that this information can be
+ * used by mcv_combine_selectivities() to produce a selectivity estimate that
+ * makes use of both per-column and multi-column statistics.
+ *
+ * Additionally, we return information to help compute the overall selectivity
+ * of the ORed list of clauses assumed to contain this clause.  This function
+ * is intended to be called for each clause in the ORed list of clauses,
+ * allowing the overall selectivity to be computed using the following
+ * algorithm:
+ *
+ * Suppose P[n] = P(C[1] OR C[2] OR ... OR C[n]) is the combined selectivity
+ * of the first n clauses in the list.  Then the combined selectivity taking
+ * into account the next clause C[n+1] can be written as
+ *
+ *		P[n+1] = P[n] + P(C[n+1]) - P((C[1] OR ... OR C[n]) AND C[n+1])
+ *
+ * The final term above represents the overlap between the clauses examined so
+ * far and the (n+1)'th clause.  To estimate its selectivity, we track the
+ * match bitmap for the ORed list of clauses examined so far and examine its
+ * intersection with the match bitmap for the (n+1)'th clause.
+ *
+ * We then also return the sums of the MCV item frequencies and base
+ * frequencies for the match bitmap intersection corresponding to the overlap
+ * term above, so that they can be combined with a simple selectivity estimate
+ * for that term.
+ *
+ * The parameter "or_matches" is an in/out parameter tracking the match bitmap
+ * for the clauses examined so far.  The caller is expected to set it to NULL
+ * the first time it calls this function.
+ */
+Selectivity
+mcv_clause_selectivity_or(PlannerInfo *root, StatisticExtInfo *stat,
+						  MCVList *mcv, Node *clause, bool **or_matches,
+						  Selectivity *basesel, Selectivity *overlap_mcvsel,
+						  Selectivity *overlap_basesel, Selectivity *totalsel)
+{
+	Selectivity s = 0.0;
+	bool	   *new_matches;
+	int			i;
+
+	/* build the OR-matches bitmap, if not built already */
+	if (*or_matches == NULL)
+		*or_matches = palloc0(sizeof(bool) * mcv->nitems);
+
+	/* build the match bitmap for the new clause */
+	new_matches = mcv_get_match_bitmap(root, list_make1(clause), stat->keys,
+									   mcv, false);
+
+	/*
+	 * Sum the frequencies for all the MCV items matching this clause and also
+	 * those matching the overlap between this clause and any of the preceding
+	 * clauses as described above.
+	 */
+	*basesel = 0.0;
+	*overlap_mcvsel = 0.0;
+	*overlap_basesel = 0.0;
+	*totalsel = 0.0;
+	for (i = 0; i < mcv->nitems; i++)
+	{
+		*totalsel += mcv->items[i].frequency;
+
+		if (new_matches[i])
+		{
+			s += mcv->items[i].frequency;
+			*basesel += mcv->items[i].base_frequency;
+
+			if ((*or_matches)[i])
+			{
+				*overlap_mcvsel += mcv->items[i].frequency;
+				*overlap_basesel += mcv->items[i].base_frequency;
+			}
+		}
+
+		/* update the OR-matches bitmap for the next clause */
+		(*or_matches)[i] = (*or_matches)[i] || new_matches[i];
+	}
+
+	pfree(new_matches);
 
 	return s;
 }

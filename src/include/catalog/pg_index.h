@@ -4,7 +4,7 @@
  *	  definition of the "index" system catalog (pg_index)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_index.h
@@ -44,12 +44,14 @@ CATALOG(pg_index,2610,IndexRelationId) BKI_SCHEMA_MACRO
 	bool		indisreplident; /* is this index the identity for replication? */
 
 	/* variable-length fields start here, but we allow direct access to indkey */
-	int2vector	indkey;			/* column numbers of indexed cols, or 0 */
+	int2vector	indkey BKI_FORCE_NOT_NULL;	/* column numbers of indexed cols,
+											 * or 0 */
 
 #ifdef CATALOG_VARLEN
-	oidvector	indcollation;	/* collation identifiers */
-	oidvector	indclass;		/* opclass identifiers */
-	int2vector	indoption;		/* per-column flags (AM-specific meanings) */
+	oidvector	indcollation BKI_FORCE_NOT_NULL;	/* collation identifiers */
+	oidvector	indclass BKI_FORCE_NOT_NULL;	/* opclass identifiers */
+	int2vector	indoption BKI_FORCE_NOT_NULL;	/* per-column flags
+												 * (AM-specific meanings) */
 	pg_node_tree indexprs;		/* expression trees for index attributes that
 								 * are not simple column references; one for
 								 * each zero entry in indkey[] */
@@ -64,6 +66,11 @@ CATALOG(pg_index,2610,IndexRelationId) BKI_SCHEMA_MACRO
  * ----------------
  */
 typedef FormData_pg_index *Form_pg_index;
+
+DECLARE_INDEX(pg_index_indrelid_index, 2678, on pg_index using btree(indrelid oid_ops));
+#define IndexIndrelidIndexId  2678
+DECLARE_UNIQUE_INDEX(pg_index_indexrelid_index, 2679, on pg_index using btree(indexrelid oid_ops));
+#define IndexRelidIndexId  2679
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 

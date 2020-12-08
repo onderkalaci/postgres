@@ -4,7 +4,7 @@
  *	  Utility routines for the Postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,6 +20,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
@@ -40,6 +41,7 @@ ginhandler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = 0;
 	amroutine->amsupport = GINNProcs;
+	amroutine->amoptsprocnum = GIN_OPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
@@ -53,6 +55,9 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->ampredlocks = true;
 	amroutine->amcanparallel = false;
 	amroutine->amcaninclude = false;
+	amroutine->amusemaintenanceworkmem = true;
+	amroutine->amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP;
 	amroutine->amkeytype = InvalidOid;
 
 	amroutine->ambuild = ginbuild;
@@ -66,6 +71,7 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = ginvalidate;
+	amroutine->amadjustmembers = ginadjustmembers;
 	amroutine->ambeginscan = ginbeginscan;
 	amroutine->amrescan = ginrescan;
 	amroutine->amgettuple = NULL;

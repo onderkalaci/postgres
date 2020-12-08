@@ -38,6 +38,13 @@ SELECT 3 as three, 4 as four \gx
 
 \unset FETCH_COUNT
 
+-- \g/\gx with pset options
+
+SELECT 1 as one, 2 as two \g (format=csv csv_fieldsep='\t')
+\g
+SELECT 1 as one, 2 as two \gx (title='foo bar')
+\g
+
 -- \gset
 
 select 10 as test01, 20 as test02, 'Hello' as test03 \gset pref01_
@@ -47,6 +54,9 @@ select 10 as test01, 20 as test02, 'Hello' as test03 \gset pref01_
 -- should fail: bad variable name
 select 10 as "bad name"
 \gset
+
+select 97 as "EOF", 'ok' as _foo \gset IGNORE
+\echo :IGNORE_foo :IGNOREEOF
 
 -- multiple backslash commands in one line
 select 1 as x, 2 as y \gset pref01_ \\ \echo :pref01_x
@@ -448,20 +458,38 @@ select 1 where false;
 \df exp
 \pset tuples_only false
 
--- check conditional tableam display
+-- check conditional am display
+\pset expanded off
 
--- Create a heap2 table am handler with heapam handler
+CREATE SCHEMA tableam_display;
+CREATE ROLE regress_display_role;
+ALTER SCHEMA tableam_display OWNER TO regress_display_role;
+SET search_path TO tableam_display;
 CREATE ACCESS METHOD heap_psql TYPE TABLE HANDLER heap_tableam_handler;
+SET ROLE TO regress_display_role;
+-- Use only relations with a physical size of zero.
 CREATE TABLE tbl_heap_psql(f1 int, f2 char(100)) using heap_psql;
 CREATE TABLE tbl_heap(f1 int, f2 char(100)) using heap;
+CREATE VIEW view_heap_psql AS SELECT f1 from tbl_heap_psql;
+CREATE MATERIALIZED VIEW mat_view_heap_psql USING heap_psql AS SELECT f1 from tbl_heap_psql;
 \d+ tbl_heap_psql
 \d+ tbl_heap
 \set HIDE_TABLEAM off
 \d+ tbl_heap_psql
 \d+ tbl_heap
+-- AM is displayed for tables, indexes and materialized views.
+\d+
+\dt+
+\dm+
+-- But not for views and sequences.
+\dv+
 \set HIDE_TABLEAM on
-DROP TABLE tbl_heap, tbl_heap_psql;
+\d+
+RESET ROLE;
+RESET search_path;
+DROP SCHEMA tableam_display CASCADE;
 DROP ACCESS METHOD heap_psql;
+DROP ROLE regress_display_role;
 
 -- test numericlocale (as best we can without control of psql's locale)
 
@@ -1182,3 +1210,21 @@ drop role regress_partitioning_role;
 
 -- \d on toast table (use pg_statistic's toast table, which has a known name)
 \d pg_toast.pg_toast_2619
+
+-- check printing info about access methods
+\dA
+\dA *
+\dA h*
+\dA foo
+\dA foo bar
+\dA+
+\dA+ *
+\dA+ h*
+\dA+ foo
+\dAc brin pg*.oid*
+\dAf spgist
+\dAf btree int4
+\dAo+ btree float_ops
+\dAo * pg_catalog.jsonb_path_ops
+\dAp+ btree float_ops
+\dAp * pg_catalog.uuid_ops

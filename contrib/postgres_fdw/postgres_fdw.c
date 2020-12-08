@@ -3,7 +3,7 @@
  * postgres_fdw.c
  *		  Foreign-data wrapper for remote PostgreSQL servers
  *
- * Portions Copyright (c) 2012-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/postgres_fdw.c
@@ -11,6 +11,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <limits.h>
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
@@ -30,6 +32,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
@@ -449,6 +452,7 @@ static void init_returning_filter(PgFdwDirectModifyState *dmstate,
 								  List *fdw_scan_tlist,
 								  Index rtindex);
 static TupleTableSlot *apply_returning_filter(PgFdwDirectModifyState *dmstate,
+											  ResultRelInfo *resultRelInfo,
 											  TupleTableSlot *slot,
 											  EState *estate);
 static void prepare_query_params(PlanState *node,
@@ -574,9 +578,6 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	PgFdwRelationInfo *fpinfo;
 	ListCell   *lc;
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
-	const char *namespace;
-	const char *relname;
-	const char *refname;
 
 	/*
 	 * We use PgFdwRelationInfo to pass various information to subsequent
@@ -693,15 +694,14 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	else
 	{
 		/*
-		 * If the foreign table has never been ANALYZEd, it will have relpages
-		 * and reltuples equal to zero, which most likely has nothing to do
-		 * with reality.  We can't do a whole lot about that if we're not
+		 * If the foreign table has never been ANALYZEd, it will have
+		 * reltuples < 0, meaning "unknown".  We can't do much if we're not
 		 * allowed to consult the remote server, but we can use a hack similar
 		 * to plancat.c's treatment of empty relations: use a minimum size
 		 * estimate of 10 pages, and divide by the column-datatype-based width
 		 * estimate to get the corresponding number of tuples.
 		 */
-		if (baserel->pages == 0 && baserel->tuples == 0)
+		if (baserel->tuples < 0)
 		{
 			baserel->pages = 10;
 			baserel->tuples =
@@ -719,21 +719,11 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	}
 
 	/*
-	 * Set the name of relation in fpinfo, while we are constructing it here.
-	 * It will be used to build the string describing the join relation in
-	 * EXPLAIN output. We can't know whether VERBOSE option is specified or
-	 * not, so always schema-qualify the foreign table name.
+	 * fpinfo->relation_name gets the numeric rangetable index of the foreign
+	 * table RTE.  (If this query gets EXPLAIN'd, we'll convert that to a
+	 * human-readable string at that time.)
 	 */
-	fpinfo->relation_name = makeStringInfo();
-	namespace = get_namespace_name(get_rel_namespace(foreigntableid));
-	relname = get_rel_name(foreigntableid);
-	refname = rte->eref->aliasname;
-	appendStringInfo(fpinfo->relation_name, "%s.%s",
-					 quote_identifier(namespace),
-					 quote_identifier(relname));
-	if (*refname && strcmp(refname, relname) != 0)
-		appendStringInfo(fpinfo->relation_name, " %s",
-						 quote_identifier(rte->eref->aliasname));
+	fpinfo->relation_name = psprintf("%u", baserel->relid);
 
 	/* No outer and inner relations. */
 	fpinfo->make_outerrel_subquery = false;
@@ -1376,7 +1366,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 							 makeInteger(fpinfo->fetch_size));
 	if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
 		fdw_private = lappend(fdw_private,
-							  makeString(fpinfo->relation_name->data));
+							  makeString(fpinfo->relation_name));
 
 	/*
 	 * Create the ForeignScan node for the given relation.
@@ -2299,9 +2289,10 @@ postgresPlanDirectModify(PlannerInfo *root,
 	}
 
 	/*
-	 * Update the operation info.
+	 * Update the operation and target relation info.
 	 */
 	fscan->operation = operation;
+	fscan->resultRelation = resultRelation;
 
 	/*
 	 * Update the fdw_exprs list that will be available to the executor.
@@ -2367,7 +2358,7 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 	 * Identify which user to do the remote access as.  This should match what
 	 * ExecCheckRTEPerms() does.
 	 */
-	rtindex = estate->es_result_relation_info->ri_RangeTableIndex;
+	rtindex = node->resultRelInfo->ri_RangeTableIndex;
 	rte = exec_rt_fetch(rtindex, estate);
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
 
@@ -2462,7 +2453,7 @@ postgresIterateDirectModify(ForeignScanState *node)
 {
 	PgFdwDirectModifyState *dmstate = (PgFdwDirectModifyState *) node->fdw_state;
 	EState	   *estate = node->ss.ps.state;
-	ResultRelInfo *resultRelInfo = estate->es_result_relation_info;
+	ResultRelInfo *resultRelInfo = node->resultRelInfo;
 
 	/*
 	 * If this is the first call after Begin, execute the statement.
@@ -2528,20 +2519,92 @@ postgresEndDirectModify(ForeignScanState *node)
 static void
 postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
-	List	   *fdw_private;
-	char	   *sql;
-	char	   *relations;
-
-	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
+	ForeignScan *plan = castNode(ForeignScan, node->ss.ps.plan);
+	List	   *fdw_private = plan->fdw_private;
 
 	/*
-	 * Add names of relation handled by the foreign scan when the scan is a
-	 * join
+	 * Identify foreign scans that are really joins or upper relations.  The
+	 * input looks something like "(1) LEFT JOIN (2)", and we must replace the
+	 * digit string(s), which are RT indexes, with the correct relation names.
+	 * We do that here, not when the plan is created, because we can't know
+	 * what aliases ruleutils.c will assign at plan creation time.
 	 */
 	if (list_length(fdw_private) > FdwScanPrivateRelations)
 	{
-		relations = strVal(list_nth(fdw_private, FdwScanPrivateRelations));
-		ExplainPropertyText("Relations", relations, es);
+		StringInfo	relations;
+		char	   *rawrelations;
+		char	   *ptr;
+		int			minrti,
+					rtoffset;
+
+		rawrelations = strVal(list_nth(fdw_private, FdwScanPrivateRelations));
+
+		/*
+		 * A difficulty with using a string representation of RT indexes is
+		 * that setrefs.c won't update the string when flattening the
+		 * rangetable.  To find out what rtoffset was applied, identify the
+		 * minimum RT index appearing in the string and compare it to the
+		 * minimum member of plan->fs_relids.  (We expect all the relids in
+		 * the join will have been offset by the same amount; the Asserts
+		 * below should catch it if that ever changes.)
+		 */
+		minrti = INT_MAX;
+		ptr = rawrelations;
+		while (*ptr)
+		{
+			if (isdigit((unsigned char) *ptr))
+			{
+				int			rti = strtol(ptr, &ptr, 10);
+
+				if (rti < minrti)
+					minrti = rti;
+			}
+			else
+				ptr++;
+		}
+		rtoffset = bms_next_member(plan->fs_relids, -1) - minrti;
+
+		/* Now we can translate the string */
+		relations = makeStringInfo();
+		ptr = rawrelations;
+		while (*ptr)
+		{
+			if (isdigit((unsigned char) *ptr))
+			{
+				int			rti = strtol(ptr, &ptr, 10);
+				RangeTblEntry *rte;
+				char	   *relname;
+				char	   *refname;
+
+				rti += rtoffset;
+				Assert(bms_is_member(rti, plan->fs_relids));
+				rte = rt_fetch(rti, es->rtable);
+				Assert(rte->rtekind == RTE_RELATION);
+				/* This logic should agree with explain.c's ExplainTargetRel */
+				relname = get_rel_name(rte->relid);
+				if (es->verbose)
+				{
+					char	   *namespace;
+
+					namespace = get_namespace_name(get_rel_namespace(rte->relid));
+					appendStringInfo(relations, "%s.%s",
+									 quote_identifier(namespace),
+									 quote_identifier(relname));
+				}
+				else
+					appendStringInfoString(relations,
+										   quote_identifier(relname));
+				refname = (char *) list_nth(es->rtable_names, rti - 1);
+				if (refname == NULL)
+					refname = rte->eref->aliasname;
+				if (strcmp(refname, relname) != 0)
+					appendStringInfo(relations, " %s",
+									 quote_identifier(refname));
+			}
+			else
+				appendStringInfoChar(relations, *ptr++);
+		}
+		ExplainPropertyText("Relations", relations->data, es);
 	}
 
 	/*
@@ -2549,6 +2612,8 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	 */
 	if (es->verbose)
 	{
+		char	   *sql;
+
 		sql = strVal(list_nth(fdw_private, FdwScanPrivateSelectSql));
 		ExplainPropertyText("Remote SQL", sql, es);
 	}
@@ -2880,16 +2945,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			MemSet(&aggcosts, 0, sizeof(AggClauseCosts));
 			if (root->parse->hasAggs)
 			{
-				get_agg_clause_costs(root, (Node *) fpinfo->grouped_tlist,
-									 AGGSPLIT_SIMPLE, &aggcosts);
-
-				/*
-				 * The cost of aggregates in the HAVING qual will be the same
-				 * for each child as it is for the parent, so there's no need
-				 * to use a translated version of havingQual.
-				 */
-				get_agg_clause_costs(root, (Node *) root->parse->havingQual,
-									 AGGSPLIT_SIMPLE, &aggcosts);
+				get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &aggcosts);
 			}
 
 			/* Get number of grouping columns and possible number of groups */
@@ -4024,7 +4080,7 @@ get_returning_data(ForeignScanState *node)
 {
 	PgFdwDirectModifyState *dmstate = (PgFdwDirectModifyState *) node->fdw_state;
 	EState	   *estate = node->ss.ps.state;
-	ResultRelInfo *resultRelInfo = estate->es_result_relation_info;
+	ResultRelInfo *resultRelInfo = node->resultRelInfo;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	TupleTableSlot *resultSlot;
 
@@ -4079,7 +4135,7 @@ get_returning_data(ForeignScanState *node)
 		if (dmstate->rel)
 			resultSlot = slot;
 		else
-			resultSlot = apply_returning_filter(dmstate, slot, estate);
+			resultSlot = apply_returning_filter(dmstate, resultRelInfo, slot, estate);
 	}
 	dmstate->next_tuple++;
 
@@ -4168,10 +4224,10 @@ init_returning_filter(PgFdwDirectModifyState *dmstate,
  */
 static TupleTableSlot *
 apply_returning_filter(PgFdwDirectModifyState *dmstate,
+					   ResultRelInfo *resultRelInfo,
 					   TupleTableSlot *slot,
 					   EState *estate)
 {
-	ResultRelInfo *relInfo = estate->es_result_relation_info;
 	TupleDesc	resultTupType = RelationGetDescr(dmstate->resultRel);
 	TupleTableSlot *resultSlot;
 	Datum	   *values;
@@ -4183,7 +4239,7 @@ apply_returning_filter(PgFdwDirectModifyState *dmstate,
 	/*
 	 * Use the return tuple slot as a place to store the result tuple.
 	 */
-	resultSlot = ExecGetReturningSlot(estate, relInfo);
+	resultSlot = ExecGetReturningSlot(estate, resultRelInfo);
 
 	/*
 	 * Extract all the values of the scan tuple.
@@ -5171,13 +5227,14 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 
 	/*
 	 * Set the string describing this join relation to be used in EXPLAIN
-	 * output of corresponding ForeignScan.
+	 * output of corresponding ForeignScan.  Note that the decoration we add
+	 * to the base relation names mustn't include any digits, or it'll confuse
+	 * postgresExplainForeignScan.
 	 */
-	fpinfo->relation_name = makeStringInfo();
-	appendStringInfo(fpinfo->relation_name, "(%s) %s JOIN (%s)",
-					 fpinfo_o->relation_name->data,
-					 get_jointype_name(fpinfo->jointype),
-					 fpinfo_i->relation_name->data);
+	fpinfo->relation_name = psprintf("(%s) %s JOIN (%s)",
+									 fpinfo_o->relation_name,
+									 get_jointype_name(fpinfo->jointype),
+									 fpinfo_i->relation_name);
 
 	/*
 	 * Set the relation index.  This is defined as the position of this
@@ -5723,11 +5780,12 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 
 	/*
 	 * Set the string describing this grouped relation to be used in EXPLAIN
-	 * output of corresponding ForeignScan.
+	 * output of corresponding ForeignScan.  Note that the decoration we add
+	 * to the base relation name mustn't include any digits, or it'll confuse
+	 * postgresExplainForeignScan.
 	 */
-	fpinfo->relation_name = makeStringInfo();
-	appendStringInfo(fpinfo->relation_name, "Aggregate on (%s)",
-					 ofpinfo->relation_name->data);
+	fpinfo->relation_name = psprintf("Aggregate on (%s)",
+									 ofpinfo->relation_name);
 
 	return true;
 }
@@ -6456,35 +6514,6 @@ conversion_error_callback(void *arg)
 		else if (attname)
 			errcontext("column \"%s\" of foreign table \"%s\"", attname, relname);
 	}
-}
-
-/*
- * Find an equivalence class member expression, all of whose Vars, come from
- * the indicated relation.
- */
-Expr *
-find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
-{
-	ListCell   *lc_em;
-
-	foreach(lc_em, ec->ec_members)
-	{
-		EquivalenceMember *em = lfirst(lc_em);
-
-		if (bms_is_subset(em->em_relids, rel->relids) &&
-			!bms_is_empty(em->em_relids))
-		{
-			/*
-			 * If there is more than one equivalence member whose Vars are
-			 * taken entirely from this relation, we'll be content to choose
-			 * any one of those.
-			 */
-			return em->em_expr;
-		}
-	}
-
-	/* We didn't find any suitable equivalence class expression */
-	return NULL;
 }
 
 /*

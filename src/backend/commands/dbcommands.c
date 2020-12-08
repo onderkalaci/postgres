@@ -8,7 +8,7 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1947,11 +1947,11 @@ remove_dbtablespaces(Oid db_id)
 	Relation	rel;
 	TableScanDesc scan;
 	HeapTuple	tuple;
-	List		*ltblspc = NIL;
-	ListCell	*cell;
-	int		ntblspc;
-	int		i;
-	Oid		*tablespace_ids;
+	List	   *ltblspc = NIL;
+	ListCell   *cell;
+	int			ntblspc;
+	int			i;
+	Oid		   *tablespace_ids;
 
 	rel = table_open(TableSpaceRelationId, AccessShareLock);
 	scan = table_beginscan_catalog(rel, 0, NULL);

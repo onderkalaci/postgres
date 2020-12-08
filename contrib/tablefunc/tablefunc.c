@@ -10,7 +10,7 @@
  * And contributors:
  * Nabil Sayegh <postgresql@e-trolley.de>
  *
- * Copyright (c) 2002-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2020, PostgreSQL Global Development Group
  *
  * Permission to use, copy, modify, and distribute this software and its
  * documentation for any purpose, without fee, and without a written agreement
@@ -49,7 +49,6 @@ static HTAB *load_categories_hash(char *cats_sql, MemoryContext per_query_ctx);
 static Tuplestorestate *get_crosstab_tuplestore(char *sql,
 												HTAB *crosstab_hash,
 												TupleDesc tupdesc,
-												MemoryContext per_query_ctx,
 												bool randomAccess);
 static void validateConnectbyTupleDesc(TupleDesc tupdesc, bool show_branch, bool show_serial);
 static bool compatCrosstabTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2);
@@ -185,6 +184,8 @@ normal_rand(PG_FUNCTION_ARGS)
 	/* stuff done only on the first call of the function */
 	if (SRF_IS_FIRSTCALL())
 	{
+		int32		num_tuples;
+
 		/* create a function context for cross-call persistence */
 		funcctx = SRF_FIRSTCALL_INIT();
 
@@ -194,7 +195,12 @@ normal_rand(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* total number of tuples to be returned */
-		funcctx->max_calls = PG_GETARG_UINT32(0);
+		num_tuples = PG_GETARG_INT32(0);
+		if (num_tuples < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("number of rows cannot be negative")));
+		funcctx->max_calls = num_tuples;
 
 		/* allocate memory for user context */
 		fctx = (normal_rand_fctx *) palloc(sizeof(normal_rand_fctx));
@@ -373,8 +379,7 @@ crosstab(PG_FUNCTION_ARGS)
 	if (!(rsinfo->allowedModes & SFRM_Materialize))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not " \
-						"allowed in this context")));
+				 errmsg("materialize mode required, but it is not allowed in this context")));
 
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 
@@ -650,8 +655,7 @@ crosstab_hash(PG_FUNCTION_ARGS)
 		rsinfo->expectedDesc == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not " \
-						"allowed in this context")));
+				 errmsg("materialize mode required, but it is not allowed in this context")));
 
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
@@ -682,7 +686,6 @@ crosstab_hash(PG_FUNCTION_ARGS)
 	rsinfo->setResult = get_crosstab_tuplestore(sql,
 												crosstab_hash,
 												tupdesc,
-												per_query_ctx,
 												rsinfo->allowedModes & SFRM_Materialize_Random);
 
 	/*
@@ -762,6 +765,11 @@ load_categories_hash(char *cats_sql, MemoryContext per_query_ctx)
 
 			/* get the category from the current sql result tuple */
 			catname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
+			if (catname == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("provided \"categories\" SQL must " \
+								"not return NULL values")));
 
 			SPIcontext = MemoryContextSwitchTo(per_query_ctx);
 
@@ -790,7 +798,6 @@ static Tuplestorestate *
 get_crosstab_tuplestore(char *sql,
 						HTAB *crosstab_hash,
 						TupleDesc tupdesc,
-						MemoryContext per_query_ctx,
 						bool randomAccess)
 {
 	Tuplestorestate *tupstore;
@@ -1006,8 +1013,7 @@ connectby_text(PG_FUNCTION_ARGS)
 		rsinfo->expectedDesc == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not " \
-						"allowed in this context")));
+				 errmsg("materialize mode required, but it is not allowed in this context")));
 
 	if (fcinfo->nargs == 6)
 	{
@@ -1086,8 +1092,7 @@ connectby_text_serial(PG_FUNCTION_ARGS)
 		rsinfo->expectedDesc == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not " \
-						"allowed in this context")));
+				 errmsg("materialize mode required, but it is not allowed in this context")));
 
 	if (fcinfo->nargs == 7)
 	{

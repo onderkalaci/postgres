@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -458,6 +458,7 @@ do_compile(FunctionCallInfo fcinfo,
 				/* Remember arguments in appropriate arrays */
 				if (argmode == PROARGMODE_IN ||
 					argmode == PROARGMODE_INOUT ||
+					(argmode == PROARGMODE_OUT && function->fn_prokind == PROKIND_PROCEDURE) ||
 					argmode == PROARGMODE_VARIADIC)
 					in_arg_varnos[num_in_args++] = argvariable->dno;
 				if (argmode == PROARGMODE_OUT ||
@@ -507,11 +508,13 @@ do_compile(FunctionCallInfo fcinfo,
 			{
 				if (forValidator)
 				{
-					if (rettypeid == ANYARRAYOID)
+					if (rettypeid == ANYARRAYOID ||
+						rettypeid == ANYCOMPATIBLEARRAYOID)
 						rettypeid = INT4ARRAYOID;
-					else if (rettypeid == ANYRANGEOID)
+					else if (rettypeid == ANYRANGEOID ||
+							 rettypeid == ANYCOMPATIBLERANGEOID)
 						rettypeid = INT4RANGEOID;
-					else		/* ANYELEMENT or ANYNONARRAY */
+					else		/* ANYELEMENT or ANYNONARRAY or ANYCOMPATIBLE */
 						rettypeid = INT4OID;
 					/* XXX what could we use for ANYENUM? */
 				}
@@ -548,7 +551,7 @@ do_compile(FunctionCallInfo fcinfo,
 				if (rettypeid == VOIDOID ||
 					rettypeid == RECORDOID)
 					 /* okay */ ;
-				else if (rettypeid == TRIGGEROID || rettypeid == EVTTRIGGEROID)
+				else if (rettypeid == TRIGGEROID || rettypeid == EVENT_TRIGGEROID)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("trigger functions can only be called as triggers")));
@@ -1776,6 +1779,7 @@ PLpgSQL_type *
 plpgsql_parse_wordrowtype(char *ident)
 {
 	Oid			classOid;
+	Oid			typOid;
 
 	/*
 	 * Look up the relation.  Note that because relation rowtypes have the
@@ -1790,8 +1794,16 @@ plpgsql_parse_wordrowtype(char *ident)
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("relation \"%s\" does not exist", ident)));
 
+	/* Some relkinds lack type OIDs */
+	typOid = get_rel_type_id(classOid);
+	if (!OidIsValid(typOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" does not have a composite type",
+						ident)));
+
 	/* Build and return the row type struct */
-	return plpgsql_build_datatype(get_rel_type_id(classOid), -1, InvalidOid,
+	return plpgsql_build_datatype(typOid, -1, InvalidOid,
 								  makeTypeName(ident));
 }
 
@@ -1804,6 +1816,7 @@ PLpgSQL_type *
 plpgsql_parse_cwordrowtype(List *idents)
 {
 	Oid			classOid;
+	Oid			typOid;
 	RangeVar   *relvar;
 	MemoryContext oldCxt;
 
@@ -1823,10 +1836,18 @@ plpgsql_parse_cwordrowtype(List *idents)
 						  -1);
 	classOid = RangeVarGetRelid(relvar, NoLock, false);
 
+	/* Some relkinds lack type OIDs */
+	typOid = get_rel_type_id(classOid);
+	if (!OidIsValid(typOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" does not have a composite type",
+						strVal(lsecond(idents)))));
+
 	MemoryContextSwitchTo(oldCxt);
 
 	/* Build and return the row type struct */
-	return plpgsql_build_datatype(get_rel_type_id(classOid), -1, InvalidOid,
+	return plpgsql_build_datatype(typOid, -1, InvalidOid,
 								  makeTypeNameFromNameList(idents));
 }
 
@@ -2125,13 +2146,13 @@ build_datatype(HeapTuple typeTup, int32 typmod,
 		 */
 		typ->typisarray = (typeStruct->typlen == -1 &&
 						   OidIsValid(typeStruct->typelem) &&
-						   typeStruct->typstorage != 'p');
+						   typeStruct->typstorage != TYPSTORAGE_PLAIN);
 	}
 	else if (typeStruct->typtype == TYPTYPE_DOMAIN)
 	{
 		/* we can short-circuit looking up base types if it's not varlena */
 		typ->typisarray = (typeStruct->typlen == -1 &&
-						   typeStruct->typstorage != 'p' &&
+						   typeStruct->typstorage != TYPSTORAGE_PLAIN &&
 						   OidIsValid(get_base_element_type(typeStruct->typbasetype)));
 	}
 	else
@@ -2418,12 +2439,19 @@ compute_function_hashkey(FunctionCallInfo fcinfo,
 
 	/* get call context */
 	hashkey->isTrigger = CALLED_AS_TRIGGER(fcinfo);
+	hashkey->isEventTrigger = CALLED_AS_EVENT_TRIGGER(fcinfo);
 
 	/*
-	 * if trigger, get its OID.  In validation mode we do not know what
-	 * relation or transition table names are intended to be used, so we leave
-	 * trigOid zero; the hash entry built in this case will never really be
-	 * used.
+	 * If DML trigger, include trigger's OID in the hash, so that each trigger
+	 * usage gets a different hash entry, allowing for e.g. different relation
+	 * rowtypes or transition table names.  In validation mode we do not know
+	 * what relation or transition table names are intended to be used, so we
+	 * leave trigOid zero; the hash entry built in this case will never be
+	 * used for any actual calls.
+	 *
+	 * We don't currently need to distinguish different event trigger usages
+	 * in the same way, since the special parameter variables don't vary in
+	 * type in that case.
 	 */
 	if (hashkey->isTrigger && !forValidator)
 	{
@@ -2486,12 +2514,16 @@ plpgsql_resolve_polymorphic_argtypes(int numargs,
 				case ANYELEMENTOID:
 				case ANYNONARRAYOID:
 				case ANYENUMOID:	/* XXX dubious */
+				case ANYCOMPATIBLEOID:
+				case ANYCOMPATIBLENONARRAYOID:
 					argtypes[i] = INT4OID;
 					break;
 				case ANYARRAYOID:
+				case ANYCOMPATIBLEARRAYOID:
 					argtypes[i] = INT4ARRAYOID;
 					break;
 				case ANYRANGEOID:
+				case ANYCOMPATIBLERANGEOID:
 					argtypes[i] = INT4RANGEOID;
 					break;
 				default:

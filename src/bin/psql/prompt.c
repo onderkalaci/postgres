@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2020, PostgreSQL Global Development Group
  *
  * src/bin/psql/prompt.c
  */
@@ -12,14 +12,10 @@
 #include <win32.h>
 #endif
 
-#ifdef HAVE_UNIX_SOCKETS
-#include <unistd.h>
-#include <netdb.h>
-#endif
-
 #include "common.h"
 #include "common/string.h"
 #include "input.h"
+#include "libpq/pqcomm.h"
 #include "prompt.h"
 #include "settings.h"
 
@@ -141,13 +137,12 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 						const char *host = PQhost(pset.db);
 
 						/* INET socket */
-						if (host && host[0] && !is_absolute_path(host))
+						if (host && host[0] && !is_unixsock_path(host))
 						{
 							strlcpy(buf, host, sizeof(buf));
 							if (*p == 'm')
 								buf[strcspn(buf, ".")] = '\0';
 						}
-#ifdef HAVE_UNIX_SOCKETS
 						/* UNIX socket */
 						else
 						{
@@ -158,7 +153,6 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							else
 								snprintf(buf, sizeof(buf), "[local:%s]", host);
 						}
-#endif
 					}
 					break;
 					/* DB server port number */
@@ -270,13 +264,10 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					/* execute command */
 				case '`':
 					{
-						FILE	   *fd;
-						char	   *file = pg_strdup(p + 1);
-						int			cmdend;
+						int			cmdend = strcspn(p + 1, "`");
+						char	   *file = pnstrdup(p + 1, cmdend);
+						FILE	   *fd = popen(file, "r");
 
-						cmdend = strcspn(file, "`");
-						file[cmdend] = '\0';
-						fd = popen(file, "r");
 						if (fd)
 						{
 							if (fgets(buf, sizeof(buf), fd) == NULL)
@@ -295,13 +286,10 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					/* interpolate variable */
 				case ':':
 					{
-						char	   *name;
+						int			nameend = strcspn(p + 1, ":");
+						char	   *name = pnstrdup(p + 1, nameend);
 						const char *val;
-						int			nameend;
 
-						name = pg_strdup(p + 1);
-						nameend = strcspn(name, ":");
-						name[nameend] = '\0';
 						val = GetVariable(pset.vars, name);
 						if (val)
 							strlcpy(buf, val, sizeof(buf));
@@ -379,7 +367,10 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 				if (visible)
 				{
 					chwidth = PQdsplen(p, pset.encoding);
-					if (chwidth > 0)
+
+					if (*p == '\n')
+						last_prompt1_width = 0;
+					else if (chwidth > 0)
 						last_prompt1_width += chwidth;
 				}
 

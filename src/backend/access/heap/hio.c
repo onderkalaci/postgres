@@ -3,7 +3,7 @@
  * hio.c
  *	  POSTGRES heap access method input/output code.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -46,6 +46,17 @@ RelationPutHeapTuple(Relation relation,
 	 * token set.
 	 */
 	Assert(!token || HeapTupleHeaderIsSpeculative(tuple->t_data));
+
+	/*
+	 * Do not allow tuples with invalid combinations of hint bits to be placed
+	 * on a page.  These combinations are detected as corruption by the
+	 * contrib/amcheck logic, so if you disable one or both of these
+	 * assertions, make corresponding changes there.
+	 */
+	Assert(!((tuple->t_data->t_infomask & HEAP_XMAX_LOCK_ONLY) &&
+			 (tuple->t_data->t_infomask2 & HEAP_KEYS_UPDATED)));
+	Assert(!((tuple->t_data->t_infomask & HEAP_XMAX_COMMITTED) &&
+			 (tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)));
 
 	/* Add the tuple to the page */
 	pageHeader = BufferGetPage(buffer);

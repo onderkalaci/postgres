@@ -3,7 +3,7 @@
  * rewriteDefine.c
  *	  routines for defining a rewrite rule
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,7 +23,6 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
-#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_rewrite.h"
@@ -621,7 +620,7 @@ DefineQueryRewrite(const char *rulename,
 		classForm->relam = InvalidOid;
 		classForm->reltablespace = InvalidOid;
 		classForm->relpages = 0;
-		classForm->reltuples = 0;
+		classForm->reltuples = -1;
 		classForm->relallvisible = 0;
 		classForm->reltoastrelid = InvalidOid;
 		classForm->relhasindex = false;
@@ -1002,6 +1001,8 @@ RenameRewriteRule(RangeVar *relation, const char *oldName,
 	namestrcpy(&(ruleform->rulename), newName);
 
 	CatalogTupleUpdate(pg_rewrite_desc, &ruletup->t_self, ruletup);
+
+	InvokeObjectPostAlterHook(RewriteRelationId, ruleOid, 0);
 
 	heap_freetuple(ruletup);
 	table_close(pg_rewrite_desc, RowExclusiveLock);

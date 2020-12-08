@@ -5,7 +5,7 @@
  * Routines to expose the contents of the control data file via
  * a set of SQL functions.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -94,9 +94,9 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 	 */
 	tupdesc = CreateTemplateTupleDesc(18);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "checkpoint_lsn",
-					   LSNOID, -1, 0);
+					   PG_LSNOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "redo_lsn",
-					   LSNOID, -1, 0);
+					   PG_LSNOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "redo_wal_file",
 					   TEXTOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "timeline_id",
@@ -165,8 +165,8 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 	nulls[5] = false;
 
 	values[6] = CStringGetTextDatum(psprintf("%u:%u",
-											 EpochFromFullTransactionId(ControlFile->checkPointCopy.nextFullXid),
-											 XidFromFullTransactionId(ControlFile->checkPointCopy.nextFullXid)));
+											 EpochFromFullTransactionId(ControlFile->checkPointCopy.nextXid),
+											 XidFromFullTransactionId(ControlFile->checkPointCopy.nextXid)));
 	nulls[6] = false;
 
 	values[7] = ObjectIdGetDatum(ControlFile->checkPointCopy.nextOid);
@@ -199,8 +199,7 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 	values[16] = TransactionIdGetDatum(ControlFile->checkPointCopy.newestCommitTsXid);
 	nulls[16] = false;
 
-	values[17] = TimestampTzGetDatum(
-									 time_t_to_timestamptz(ControlFile->checkPointCopy.time));
+	values[17] = TimestampTzGetDatum(time_t_to_timestamptz(ControlFile->checkPointCopy.time));
 	nulls[17] = false;
 
 	htup = heap_form_tuple(tupdesc, values, nulls);
@@ -224,13 +223,13 @@ pg_control_recovery(PG_FUNCTION_ARGS)
 	 */
 	tupdesc = CreateTemplateTupleDesc(5);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "min_recovery_end_lsn",
-					   LSNOID, -1, 0);
+					   PG_LSNOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "min_recovery_end_timeline",
 					   INT4OID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "backup_start_lsn",
-					   LSNOID, -1, 0);
+					   PG_LSNOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "backup_end_lsn",
-					   LSNOID, -1, 0);
+					   PG_LSNOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "end_of_backup_record_required",
 					   BOOLOID, -1, 0);
 	tupdesc = BlessTupleDesc(tupdesc);
@@ -275,7 +274,7 @@ pg_control_init(PG_FUNCTION_ARGS)
 	 * Construct a tuple descriptor for the result row.  This must match this
 	 * function's pg_proc entry!
 	 */
-	tupdesc = CreateTemplateTupleDesc(12);
+	tupdesc = CreateTemplateTupleDesc(11);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "max_data_alignment",
 					   INT4OID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "database_block_size",

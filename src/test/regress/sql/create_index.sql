@@ -107,14 +107,14 @@ SET enable_indexscan = OFF;
 SET enable_bitmapscan = OFF;
 
 SELECT * FROM fast_emp4000
-    WHERE home_base @ '(200,200),(2000,1000)'::box
+    WHERE home_base <@ '(200,200),(2000,1000)'::box
     ORDER BY (home_base[0])[0];
 
 SELECT count(*) FROM fast_emp4000 WHERE home_base && '(1000,1000,0,0)'::box;
 
 SELECT count(*) FROM fast_emp4000 WHERE home_base IS NULL;
 
-SELECT * FROM polygon_tbl WHERE f1 ~ '((1,1),(2,2),(2,1))'::polygon
+SELECT * FROM polygon_tbl WHERE f1 @> '((1,1),(2,2),(2,1))'::polygon
     ORDER BY (poly_center(f1))[0];
 
 SELECT * FROM circle_tbl WHERE f1 && circle(point(1,-2), 1)
@@ -136,9 +136,9 @@ SELECT count(*) FROM point_tbl p WHERE p.f1 << '(0.0, 0.0)';
 
 SELECT count(*) FROM point_tbl p WHERE p.f1 >> '(0.0, 0.0)';
 
-SELECT count(*) FROM point_tbl p WHERE p.f1 <^ '(0.0, 0.0)';
+SELECT count(*) FROM point_tbl p WHERE p.f1 <<| '(0.0, 0.0)';
 
-SELECT count(*) FROM point_tbl p WHERE p.f1 >^ '(0.0, 0.0)';
+SELECT count(*) FROM point_tbl p WHERE p.f1 |>> '(0.0, 0.0)';
 
 SELECT count(*) FROM point_tbl p WHERE p.f1 ~= '(-5, -12)';
 
@@ -161,10 +161,10 @@ SET enable_bitmapscan = OFF;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM fast_emp4000
-    WHERE home_base @ '(200,200),(2000,1000)'::box
+    WHERE home_base <@ '(200,200),(2000,1000)'::box
     ORDER BY (home_base[0])[0];
 SELECT * FROM fast_emp4000
-    WHERE home_base @ '(200,200),(2000,1000)'::box
+    WHERE home_base <@ '(200,200),(2000,1000)'::box
     ORDER BY (home_base[0])[0];
 
 EXPLAIN (COSTS OFF)
@@ -176,9 +176,9 @@ SELECT count(*) FROM fast_emp4000 WHERE home_base IS NULL;
 SELECT count(*) FROM fast_emp4000 WHERE home_base IS NULL;
 
 EXPLAIN (COSTS OFF)
-SELECT * FROM polygon_tbl WHERE f1 ~ '((1,1),(2,2),(2,1))'::polygon
+SELECT * FROM polygon_tbl WHERE f1 @> '((1,1),(2,2),(2,1))'::polygon
     ORDER BY (poly_center(f1))[0];
-SELECT * FROM polygon_tbl WHERE f1 ~ '((1,1),(2,2),(2,1))'::polygon
+SELECT * FROM polygon_tbl WHERE f1 @> '((1,1),(2,2),(2,1))'::polygon
     ORDER BY (poly_center(f1))[0];
 
 EXPLAIN (COSTS OFF)
@@ -220,12 +220,12 @@ SELECT count(*) FROM point_tbl p WHERE p.f1 >> '(0.0, 0.0)';
 SELECT count(*) FROM point_tbl p WHERE p.f1 >> '(0.0, 0.0)';
 
 EXPLAIN (COSTS OFF)
-SELECT count(*) FROM point_tbl p WHERE p.f1 <^ '(0.0, 0.0)';
-SELECT count(*) FROM point_tbl p WHERE p.f1 <^ '(0.0, 0.0)';
+SELECT count(*) FROM point_tbl p WHERE p.f1 <<| '(0.0, 0.0)';
+SELECT count(*) FROM point_tbl p WHERE p.f1 <<| '(0.0, 0.0)';
 
 EXPLAIN (COSTS OFF)
-SELECT count(*) FROM point_tbl p WHERE p.f1 >^ '(0.0, 0.0)';
-SELECT count(*) FROM point_tbl p WHERE p.f1 >^ '(0.0, 0.0)';
+SELECT count(*) FROM point_tbl p WHERE p.f1 |>> '(0.0, 0.0)';
+SELECT count(*) FROM point_tbl p WHERE p.f1 |>> '(0.0, 0.0)';
 
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM point_tbl p WHERE p.f1 ~= '(-5, -12)';
@@ -401,6 +401,10 @@ INSERT INTO func_index_heap VALUES('ABCD', 'EF');
 -- but this shouldn't:
 INSERT INTO func_index_heap VALUES('QWERTY');
 
+-- while we're here, see that the metadata looks sane
+\d func_index_heap
+\d func_index_index
+
 
 --
 -- Same test, expressional index
@@ -416,6 +420,14 @@ INSERT INTO func_index_heap VALUES('QWE','RTY');
 INSERT INTO func_index_heap VALUES('ABCD', 'EF');
 -- but this shouldn't:
 INSERT INTO func_index_heap VALUES('QWERTY');
+
+-- while we're here, see that the metadata looks sane
+\d func_index_heap
+\d func_index_index
+
+-- this should fail because of unsafe column type (anonymous record)
+create index on func_index_heap ((f1 || f2), (row(f1, f2)));
+
 
 --
 -- Test unique index with included columns
@@ -489,6 +501,31 @@ VACUUM FULL concur_heap;
 REINDEX TABLE concur_heap;
 \d concur_heap
 
+-- Temporary tables with concurrent builds and on-commit actions
+-- CONCURRENTLY used with CREATE INDEX and DROP INDEX is ignored.
+-- PRESERVE ROWS, the default.
+CREATE TEMP TABLE concur_temp (f1 int, f2 text)
+  ON COMMIT PRESERVE ROWS;
+INSERT INTO concur_temp VALUES (1, 'foo'), (2, 'bar');
+CREATE INDEX CONCURRENTLY concur_temp_ind ON concur_temp(f1);
+DROP INDEX CONCURRENTLY concur_temp_ind;
+DROP TABLE concur_temp;
+-- ON COMMIT DROP
+BEGIN;
+CREATE TEMP TABLE concur_temp (f1 int, f2 text)
+  ON COMMIT DROP;
+INSERT INTO concur_temp VALUES (1, 'foo'), (2, 'bar');
+-- Fails when running in a transaction.
+CREATE INDEX CONCURRENTLY concur_temp_ind ON concur_temp(f1);
+COMMIT;
+-- ON COMMIT DELETE ROWS
+CREATE TEMP TABLE concur_temp (f1 int, f2 text)
+  ON COMMIT DELETE ROWS;
+INSERT INTO concur_temp VALUES (1, 'foo'), (2, 'bar');
+CREATE INDEX CONCURRENTLY concur_temp_ind ON concur_temp(f1);
+DROP INDEX CONCURRENTLY concur_temp_ind;
+DROP TABLE concur_temp;
+
 --
 -- Try some concurrent index drops
 --
@@ -537,6 +574,12 @@ ALTER TABLE cwi_test DROP CONSTRAINT cwi_uniq_idx,
 \d cwi_replaced_pkey
 
 DROP INDEX cwi_replaced_pkey;	-- Should fail; a constraint depends on it
+
+-- Check that non-default index options are rejected
+CREATE UNIQUE INDEX cwi_uniq3_idx ON cwi_test(a desc);
+ALTER TABLE cwi_test ADD UNIQUE USING INDEX cwi_uniq3_idx;  -- fail
+CREATE UNIQUE INDEX cwi_uniq4_idx ON cwi_test(b collate "POSIX");
+ALTER TABLE cwi_test ADD UNIQUE USING INDEX cwi_uniq4_idx;  -- fail
 
 DROP TABLE cwi_test;
 
@@ -753,7 +796,7 @@ DROP TABLE reindex_verbose;
 CREATE TABLE concur_reindex_tab (c1 int);
 -- REINDEX
 REINDEX TABLE concur_reindex_tab; -- notice
-REINDEX TABLE CONCURRENTLY concur_reindex_tab; -- notice
+REINDEX (CONCURRENTLY) TABLE concur_reindex_tab; -- notice
 ALTER TABLE concur_reindex_tab ADD COLUMN c2 text; -- add toast index
 -- Normal index with integer column
 CREATE UNIQUE INDEX concur_reindex_ind1 ON concur_reindex_tab(c1);
@@ -815,6 +858,26 @@ SELECT obj_description('testcomment_idx1'::regclass, 'pg_class');
 REINDEX TABLE CONCURRENTLY testcomment ;
 SELECT obj_description('testcomment_idx1'::regclass, 'pg_class');
 DROP TABLE testcomment;
+-- Check that indisclustered updates are preserved
+CREATE TABLE concur_clustered(i int);
+CREATE INDEX concur_clustered_i_idx ON concur_clustered(i);
+ALTER TABLE concur_clustered CLUSTER ON concur_clustered_i_idx;
+REINDEX TABLE CONCURRENTLY concur_clustered;
+SELECT indexrelid::regclass, indisclustered FROM pg_index
+  WHERE indrelid = 'concur_clustered'::regclass;
+DROP TABLE concur_clustered;
+-- Check that indisreplident updates are preserved.
+CREATE TABLE concur_replident(i int NOT NULL);
+CREATE UNIQUE INDEX concur_replident_i_idx ON concur_replident(i);
+ALTER TABLE concur_replident REPLICA IDENTITY
+  USING INDEX concur_replident_i_idx;
+SELECT indexrelid::regclass, indisreplident FROM pg_index
+  WHERE indrelid = 'concur_replident'::regclass;
+REINDEX TABLE CONCURRENTLY concur_replident;
+SELECT indexrelid::regclass, indisreplident FROM pg_index
+  WHERE indrelid = 'concur_replident'::regclass;
+DROP TABLE concur_replident;
+
 -- Partitions
 -- Create some partitioned tables
 CREATE TABLE concur_reindex_part (c1 int, c2 int) PARTITION BY RANGE (c1);
@@ -840,12 +903,6 @@ CREATE INDEX concur_reindex_part_index_0_2 ON ONLY concur_reindex_part_0_2 (c1);
 ALTER INDEX concur_reindex_part_index_0 ATTACH PARTITION concur_reindex_part_index_0_2;
 SELECT relid, parentrelid, level FROM pg_partition_tree('concur_reindex_part_index')
   ORDER BY relid, level;
--- REINDEX fails for partitioned indexes
-REINDEX INDEX concur_reindex_part_index_10;
-REINDEX INDEX CONCURRENTLY concur_reindex_part_index_10;
--- REINDEX is a no-op for partitioned tables
-REINDEX TABLE concur_reindex_part_10;
-REINDEX TABLE CONCURRENTLY concur_reindex_part_10;
 SELECT relid, parentrelid, level FROM pg_partition_tree('concur_reindex_part_index')
   ORDER BY relid, level;
 -- REINDEX should preserve dependencies of partition tree.
@@ -885,6 +942,88 @@ WHERE classid = 'pg_class'::regclass AND
   ORDER BY 1, 2;
 SELECT relid, parentrelid, level FROM pg_partition_tree('concur_reindex_part_index')
   ORDER BY relid, level;
+
+-- REINDEX for partitioned indexes
+-- REINDEX TABLE fails for partitioned indexes
+-- Top-most parent index
+REINDEX TABLE concur_reindex_part_index; -- error
+REINDEX TABLE CONCURRENTLY concur_reindex_part_index; -- error
+-- Partitioned index with no leaves
+REINDEX TABLE concur_reindex_part_index_10; -- error
+REINDEX TABLE CONCURRENTLY concur_reindex_part_index_10; -- error
+-- Cannot run in a transaction block
+BEGIN;
+REINDEX INDEX concur_reindex_part_index;
+ROLLBACK;
+-- Helper functions to track changes of relfilenodes in a partition tree.
+-- Create a table tracking the relfilenode state.
+CREATE OR REPLACE FUNCTION create_relfilenode_part(relname text, indname text)
+  RETURNS VOID AS
+  $func$
+  BEGIN
+  EXECUTE format('
+    CREATE TABLE %I AS
+      SELECT oid, relname, relfilenode, relkind, reltoastrelid
+      FROM pg_class
+      WHERE oid IN
+         (SELECT relid FROM pg_partition_tree(''%I''));',
+	 relname, indname);
+  END
+  $func$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION compare_relfilenode_part(tabname text)
+  RETURNS TABLE (relname name, relkind "char", state text) AS
+  $func$
+  BEGIN
+    RETURN QUERY EXECUTE
+      format(
+        'SELECT  b.relname,
+                 b.relkind,
+                 CASE WHEN a.relfilenode = b.relfilenode THEN ''relfilenode is unchanged''
+                 ELSE ''relfilenode has changed'' END
+           -- Do not join with OID here as CONCURRENTLY changes it.
+           FROM %I b JOIN pg_class a ON b.relname = a.relname
+           ORDER BY 1;', tabname);
+  END
+  $func$ LANGUAGE plpgsql;
+--  Check that expected relfilenodes are changed, non-concurrent case.
+SELECT create_relfilenode_part('reindex_index_status', 'concur_reindex_part_index');
+REINDEX INDEX concur_reindex_part_index;
+SELECT * FROM compare_relfilenode_part('reindex_index_status');
+DROP TABLE reindex_index_status;
+-- concurrent case.
+SELECT create_relfilenode_part('reindex_index_status', 'concur_reindex_part_index');
+REINDEX INDEX CONCURRENTLY concur_reindex_part_index;
+SELECT * FROM compare_relfilenode_part('reindex_index_status');
+DROP TABLE reindex_index_status;
+
+-- REINDEX for partitioned tables
+-- REINDEX INDEX fails for partitioned tables
+-- Top-most parent
+REINDEX INDEX concur_reindex_part; -- error
+REINDEX INDEX CONCURRENTLY concur_reindex_part; -- error
+-- Partitioned with no leaves
+REINDEX INDEX concur_reindex_part_10; -- error
+REINDEX INDEX CONCURRENTLY concur_reindex_part_10; -- error
+-- Cannot run in a transaction block
+BEGIN;
+REINDEX TABLE concur_reindex_part;
+ROLLBACK;
+-- Check that expected relfilenodes are changed, non-concurrent case.
+-- Note that the partition tree changes of the *indexes* need to be checked.
+SELECT create_relfilenode_part('reindex_index_status', 'concur_reindex_part_index');
+REINDEX TABLE concur_reindex_part;
+SELECT * FROM compare_relfilenode_part('reindex_index_status');
+DROP TABLE reindex_index_status;
+-- concurrent case.
+SELECT create_relfilenode_part('reindex_index_status', 'concur_reindex_part_index');
+REINDEX TABLE CONCURRENTLY concur_reindex_part;
+SELECT * FROM compare_relfilenode_part('reindex_index_status');
+DROP TABLE reindex_index_status;
+
+DROP FUNCTION create_relfilenode_part;
+DROP FUNCTION compare_relfilenode_part;
+
+-- Cleanup of partition tree used for REINDEX test.
 DROP TABLE concur_reindex_part;
 
 -- Check errors
@@ -940,6 +1079,12 @@ CREATE UNIQUE INDEX concur_exprs_index_pred ON concur_exprs_tab (c1)
 CREATE UNIQUE INDEX concur_exprs_index_pred_2
   ON concur_exprs_tab ((1 / c1))
   WHERE ('-H') >= (c2::TEXT) COLLATE "C";
+ANALYZE concur_exprs_tab;
+SELECT starelid::regclass, count(*) FROM pg_statistic WHERE starelid IN (
+  'concur_exprs_index_expr'::regclass,
+  'concur_exprs_index_pred'::regclass,
+  'concur_exprs_index_pred_2'::regclass)
+  GROUP BY starelid ORDER BY starelid::regclass::text;
 SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
 SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
 SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
@@ -952,7 +1097,55 @@ ALTER TABLE concur_exprs_tab ALTER c2 TYPE TEXT;
 SELECT pg_get_indexdef('concur_exprs_index_expr'::regclass);
 SELECT pg_get_indexdef('concur_exprs_index_pred'::regclass);
 SELECT pg_get_indexdef('concur_exprs_index_pred_2'::regclass);
+-- Statistics should remain intact.
+SELECT starelid::regclass, count(*) FROM pg_statistic WHERE starelid IN (
+  'concur_exprs_index_expr'::regclass,
+  'concur_exprs_index_pred'::regclass,
+  'concur_exprs_index_pred_2'::regclass)
+  GROUP BY starelid ORDER BY starelid::regclass::text;
 DROP TABLE concur_exprs_tab;
+
+-- Temporary tables and on-commit actions, where CONCURRENTLY is ignored.
+-- ON COMMIT PRESERVE ROWS, the default.
+CREATE TEMP TABLE concur_temp_tab_1 (c1 int, c2 text)
+  ON COMMIT PRESERVE ROWS;
+INSERT INTO concur_temp_tab_1 VALUES (1, 'foo'), (2, 'bar');
+CREATE INDEX concur_temp_ind_1 ON concur_temp_tab_1(c2);
+REINDEX TABLE CONCURRENTLY concur_temp_tab_1;
+REINDEX INDEX CONCURRENTLY concur_temp_ind_1;
+-- Still fails in transaction blocks
+BEGIN;
+REINDEX INDEX CONCURRENTLY concur_temp_ind_1;
+COMMIT;
+-- ON COMMIT DELETE ROWS
+CREATE TEMP TABLE concur_temp_tab_2 (c1 int, c2 text)
+  ON COMMIT DELETE ROWS;
+CREATE INDEX concur_temp_ind_2 ON concur_temp_tab_2(c2);
+REINDEX TABLE CONCURRENTLY concur_temp_tab_2;
+REINDEX INDEX CONCURRENTLY concur_temp_ind_2;
+-- ON COMMIT DROP
+BEGIN;
+CREATE TEMP TABLE concur_temp_tab_3 (c1 int, c2 text)
+  ON COMMIT PRESERVE ROWS;
+INSERT INTO concur_temp_tab_3 VALUES (1, 'foo'), (2, 'bar');
+CREATE INDEX concur_temp_ind_3 ON concur_temp_tab_3(c2);
+-- Fails when running in a transaction
+REINDEX INDEX CONCURRENTLY concur_temp_ind_3;
+COMMIT;
+-- REINDEX SCHEMA processes all temporary relations
+CREATE TABLE reindex_temp_before AS
+SELECT oid, relname, relfilenode, relkind, reltoastrelid
+  FROM pg_class
+  WHERE relname IN ('concur_temp_ind_1', 'concur_temp_ind_2');
+SELECT pg_my_temp_schema()::regnamespace as temp_schema_name \gset
+REINDEX SCHEMA CONCURRENTLY :temp_schema_name;
+SELECT  b.relname,
+        b.relkind,
+        CASE WHEN a.relfilenode = b.relfilenode THEN 'relfilenode is unchanged'
+        ELSE 'relfilenode has changed' END
+  FROM reindex_temp_before b JOIN pg_class a ON b.oid = a.oid
+  ORDER BY 1;
+DROP TABLE concur_temp_tab_1, concur_temp_tab_2, reindex_temp_before;
 
 --
 -- REINDEX SCHEMA

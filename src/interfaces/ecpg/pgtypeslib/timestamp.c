@@ -158,7 +158,8 @@ timestamp2tm(timestamp dt, int *tzp, struct tm *tm, fsec_t *fsec, const char **t
 			if (tzn != NULL)
 				*tzn = TZNAME_GLOBAL[(tm->tm_isdst > 0)];
 #endif
-#else							/* not (HAVE_STRUCT_TM_TM_ZONE || HAVE_INT_TIMEZONE) */
+#else							/* not (HAVE_STRUCT_TM_TM_ZONE ||
+								 * HAVE_INT_TIMEZONE) */
 			*tzp = 0;
 			/* Mark this as *no* time zone available */
 			tm->tm_isdst = -1;
@@ -297,7 +298,6 @@ PGTYPEStimestamp_current(timestamp * ts)
 	GetCurrentDateTime(&tm);
 	if (errno == 0)
 		tm2timestamp(&tm, 0, NULL, ts);
-	return;
 }
 
 static int
@@ -335,13 +335,13 @@ dttofmtasc_replace(timestamp * ts, date dDate, int dow, struct tm *tm,
 					/* XXX should be locale aware */
 				case 'b':
 				case 'h':
-					replace_val.str_val = months[tm->tm_mon];
+					replace_val.str_val = months[tm->tm_mon - 1];
 					replace_type = PGTYPES_TYPE_STRING_CONSTANT;
 					break;
 					/* the full name of the month */
 					/* XXX should be locale aware */
 				case 'B':
-					replace_val.str_val = pgtypes_date_months[tm->tm_mon];
+					replace_val.str_val = pgtypes_date_months[tm->tm_mon - 1];
 					replace_type = PGTYPES_TYPE_STRING_CONSTANT;
 					break;
 

@@ -41,7 +41,8 @@ usage(const char *progname)
 	printf(_("  -?, --help             show this help, then exit\n"));
 	printf(_("\nIf no data directory (DATADIR) is specified, "
 			 "the environment variable PGDATA\nis used.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
 
@@ -249,8 +250,8 @@ main(int argc, char *argv[])
 	printf(_("Latest checkpoint's full_page_writes: %s\n"),
 		   ControlFile->checkPointCopy.fullPageWrites ? _("on") : _("off"));
 	printf(_("Latest checkpoint's NextXID:          %u:%u\n"),
-		   EpochFromFullTransactionId(ControlFile->checkPointCopy.nextFullXid),
-		   XidFromFullTransactionId(ControlFile->checkPointCopy.nextFullXid));
+		   EpochFromFullTransactionId(ControlFile->checkPointCopy.nextXid),
+		   XidFromFullTransactionId(ControlFile->checkPointCopy.nextXid));
 	printf(_("Latest checkpoint's NextOID:          %u\n"),
 		   ControlFile->checkPointCopy.nextOid);
 	printf(_("Latest checkpoint's NextMultiXactId:  %u\n"),

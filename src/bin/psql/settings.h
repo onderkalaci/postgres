@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2020, PostgreSQL Global Development Group
  *
  * src/bin/psql/settings.h
  */
@@ -23,8 +23,8 @@
 #define DEFAULT_EDITOR_LINENUMBER_ARG "+"
 #endif
 
-#define DEFAULT_PROMPT1 "%/%R%# "
-#define DEFAULT_PROMPT2 "%/%R%# "
+#define DEFAULT_PROMPT1 "%/%R%x%# "
+#define DEFAULT_PROMPT2 "%/%R%x%# "
 #define DEFAULT_PROMPT3 ">> "
 
 /*
@@ -88,10 +88,11 @@ typedef struct _psqlSettings
 
 	PGresult   *last_error_result;	/* most recent error result, if any */
 
-	printQueryOpt popt;
+	printQueryOpt popt;			/* The active print format settings */
 
 	char	   *gfname;			/* one-shot file output argument for \g */
-	bool		g_expanded;		/* one-shot expanded output requested via \gx */
+	printQueryOpt *gsavepopt;	/* if not null, saved print format settings */
+
 	char	   *gset_prefix;	/* one-shot prefix argument for \gset */
 	bool		gdesc_flag;		/* one-shot request to describe query results */
 	bool		gexec_flag;		/* one-shot request to execute query results */
@@ -115,6 +116,13 @@ typedef struct _psqlSettings
 	FILE	   *logfile;		/* session log file handle */
 
 	VariableSpace vars;			/* "shell variable" repository */
+
+	/*
+	 * If we get a connection failure, the now-unusable PGconn is stashed here
+	 * until we can successfully reconnect.  Never attempt to do anything with
+	 * this PGconn except extract parameters for a \connect attempt.
+	 */
+	PGconn	   *dead_conn;		/* previous connection to backend */
 
 	/*
 	 * The remaining fields are set by assign hooks associated with entries in

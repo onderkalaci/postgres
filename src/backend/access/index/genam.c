@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -28,6 +28,7 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -276,6 +277,10 @@ BuildIndexValueDescription(Relation indexRelation,
 /*
  * Get the latestRemovedXid from the table entries pointed at by the index
  * tuples being deleted.
+ *
+ * Note: index access methods that don't consistently use the standard
+ * IndexTuple + heap TID item pointer representation will need to provide
+ * their own version of this function.
  */
 TransactionId
 index_compute_xid_horizon_for_tuples(Relation irel,
@@ -425,7 +430,34 @@ systable_beginscan(Relation heapRelation,
 		sysscan->iscan = NULL;
 	}
 
+	/*
+	 * If CheckXidAlive is set then set a flag to indicate that system table
+	 * scan is in-progress.  See detailed comments in xact.c where these
+	 * variables are declared.
+	 */
+	if (TransactionIdIsValid(CheckXidAlive))
+		bsysscan = true;
+
 	return sysscan;
+}
+
+/*
+ * HandleConcurrentAbort - Handle concurrent abort of the CheckXidAlive.
+ *
+ * Error out, if CheckXidAlive is aborted. We can't directly use
+ * TransactionIdDidAbort as after crash such transaction might not have been
+ * marked as aborted.  See detailed comments in xact.c where the variable
+ * is declared.
+ */
+static inline void
+HandleConcurrentAbort()
+{
+	if (TransactionIdIsValid(CheckXidAlive) &&
+		!TransactionIdIsInProgress(CheckXidAlive) &&
+		!TransactionIdDidCommit(CheckXidAlive))
+		ereport(ERROR,
+				(errcode(ERRCODE_TRANSACTION_ROLLBACK),
+				 errmsg("transaction aborted during system catalog scan")));
 }
 
 /*
@@ -477,6 +509,12 @@ systable_getnext(SysScanDesc sysscan)
 		}
 	}
 
+	/*
+	 * Handle the concurrent abort while fetching the catalog tuple during
+	 * logical streaming of a transaction.
+	 */
+	HandleConcurrentAbort();
+
 	return htup;
 }
 
@@ -513,6 +551,12 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 											sysscan->slot,
 											freshsnap);
 
+	/*
+	 * Handle the concurrent abort while fetching the catalog tuple during
+	 * logical streaming of a transaction.
+	 */
+	HandleConcurrentAbort();
+
 	return result;
 }
 
@@ -540,6 +584,13 @@ systable_endscan(SysScanDesc sysscan)
 
 	if (sysscan->snapshot)
 		UnregisterSnapshot(sysscan->snapshot);
+
+	/*
+	 * Reset the bsysscan flag at the end of the systable scan.  See
+	 * detailed comments in xact.c where these variables are declared.
+	 */
+	if (TransactionIdIsValid(CheckXidAlive))
+		bsysscan = false;
 
 	pfree(sysscan);
 }
@@ -638,6 +689,12 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 	/* See notes in systable_getnext */
 	if (htup && sysscan->iscan->xs_recheck)
 		elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
+
+	/*
+	 * Handle the concurrent abort while fetching the catalog tuple during
+	 * logical streaming of a transaction.
+	 */
+	HandleConcurrentAbort();
 
 	return htup;
 }

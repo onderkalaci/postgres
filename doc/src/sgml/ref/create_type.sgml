@@ -121,8 +121,8 @@ CREATE TYPE <replaceable class="parameter">name</replaceable>
     must be less than <symbol>NAMEDATALEN</symbol> bytes long (64 bytes in a
     standard <productname>PostgreSQL</productname> build).  (It is possible to
     create an enumerated type with zero labels, but such a type cannot be used
-    to hold values before at least one label is added using <xref
-    linkend="sql-altertype"/>.)
+    to hold values before at least one label is added using <link
+    linkend="sql-altertype"><command>ALTER TYPE</command></link>.)
    </para>
   </refsect2>
 
@@ -821,18 +821,6 @@ CREATE TYPE <replaceable class="parameter">name</replaceable>
    the catalogs with shell types as a result of simple typos in function
    definitions, a shell type will only be made this way when the input
    function is written in C.
-  </para>
-
-  <para>
-   In <productname>PostgreSQL</productname> versions before 7.3, it
-   was customary to avoid creating a shell type at all, by replacing the
-   functions' forward references to the type name with the placeholder
-   pseudo-type <type>opaque</type>.  The <type>cstring</type> arguments and
-   results also had to be declared as <type>opaque</type> before 7.3.  To
-   support loading of old dump files, <command>CREATE TYPE</command> will
-   accept I/O functions declared using <type>opaque</type>, but it will issue
-   a notice and change the function declarations to use the correct
-   types.
   </para>
 
  </refsect1>

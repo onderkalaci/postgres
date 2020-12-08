@@ -700,6 +700,7 @@ explain (costs off)
 select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
 
 set enable_mergejoin = 0;
+set enable_hashjoin = 0;
 
 explain (costs off)
 select a.idv, b.idv from tidv a, tidv b where a.idv = b.idv;
@@ -905,6 +906,33 @@ where
 order by 1,2;
 
 --
+-- variant where a PlaceHolderVar is needed at a join, but not above the join
+--
+
+explain (costs off)
+select * from
+  int4_tbl as i41,
+  lateral
+    (select 1 as x from
+      (select i41.f1 as lat,
+              i42.f1 as loc from
+         int8_tbl as i81, int4_tbl as i42) as ss1
+      right join int4_tbl as i43 on (i43.f1 > 1)
+      where ss1.loc = ss1.lat) as ss2
+where i41.f1 > 0;
+
+select * from
+  int4_tbl as i41,
+  lateral
+    (select 1 as x from
+      (select i41.f1 as lat,
+              i42.f1 as loc from
+         int8_tbl as i81, int4_tbl as i42) as ss1
+      right join int4_tbl as i43 on (i43.f1 > 1)
+      where ss1.loc = ss1.lat) as ss2
+where i41.f1 > 0;
+
+--
 -- test the corner cases FULL JOIN ON TRUE and FULL JOIN ON FALSE
 --
 select * from int4_tbl a full join int4_tbl b on true;
@@ -1017,6 +1045,38 @@ select t1.unique2, t1.stringu1, t2.unique1, t2.stringu2 from
   left join tenk1 t2
   on (subq1.y1 = t2.unique1)
 where t1.unique2 < 42 and t1.stringu1 > t2.stringu2;
+
+-- Here's a variant that we can't fold too aggressively, though,
+-- or we end up with noplace to evaluate the lateral PHV
+explain (verbose, costs off)
+select * from
+  (select 1 as x) ss1 left join (select 2 as y) ss2 on (true),
+  lateral (select ss2.y as z limit 1) ss3;
+select * from
+  (select 1 as x) ss1 left join (select 2 as y) ss2 on (true),
+  lateral (select ss2.y as z limit 1) ss3;
+
+-- Test proper handling of appendrel PHVs during useless-RTE removal
+explain (costs off)
+select * from
+  (select 0 as z) as t1
+  left join
+  (select true as a) as t2
+  on true,
+  lateral (select true as b
+           union all
+           select a as b) as t3
+where b;
+
+select * from
+  (select 0 as z) as t1
+  left join
+  (select true as a) as t2
+  on true,
+  lateral (select true as b
+           union all
+           select a as b) as t3
+where b;
 
 --
 -- test inlining of immutable functions
@@ -1965,6 +2025,35 @@ select t1.b, ss.phv from join_ut1 t1 left join lateral
 
 drop table join_pt1;
 drop table join_ut1;
+
+--
+-- test estimation behavior with multi-column foreign key and constant qual
+--
+
+begin;
+
+create table fkest (x integer, x10 integer, x10b integer, x100 integer);
+insert into fkest select x, x/10, x/10, x/100 from generate_series(1,1000) x;
+create unique index on fkest(x, x10, x100);
+analyze fkest;
+
+explain (costs off)
+select * from fkest f1
+  join fkest f2 on (f1.x = f2.x and f1.x10 = f2.x10b and f1.x100 = f2.x100)
+  join fkest f3 on f1.x = f3.x
+  where f1.x100 = 2;
+
+alter table fkest add constraint fk
+  foreign key (x, x10b, x100) references fkest (x, x10, x100);
+
+explain (costs off)
+select * from fkest f1
+  join fkest f2 on (f1.x = f2.x and f1.x10 = f2.x10b and f1.x100 = f2.x100)
+  join fkest f3 on f1.x = f3.x
+  where f1.x100 = 2;
+
+rollback;
+
 --
 -- test that foreign key join estimation performs sanely for outer joins
 --
@@ -2113,6 +2202,24 @@ where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1;
 select * from j1
 inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
 where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1;
+
+-- Exercise array keys mark/restore B-Tree code
+explain (costs off) select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 = any (array[1]);
+
+select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 = any (array[1]);
+
+-- Exercise array keys "find extreme element" B-Tree code
+explain (costs off) select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 >= any (array[1,5]);
+
+select * from j1
+inner join j2 on j1.id1 = j2.id1 and j1.id2 = j2.id2
+where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 >= any (array[1,5]);
 
 reset enable_nestloop;
 reset enable_hashjoin;

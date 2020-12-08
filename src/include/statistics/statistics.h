@@ -3,7 +3,7 @@
  * statistics.h
  *	  Extended statistics and selectivity estimation functions.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/statistics/statistics.h
@@ -100,8 +100,8 @@ extern MCVList *statext_mcv_load(Oid mvoid);
 extern void BuildRelationExtStatistics(Relation onerel, double totalrows,
 									   int numrows, HeapTuple *rows,
 									   int natts, VacAttrStats **vacattrstats);
-extern int ComputeExtStatisticsRows(Relation onerel,
-									int natts, VacAttrStats **stats);
+extern int	ComputeExtStatisticsRows(Relation onerel,
+									 int natts, VacAttrStats **stats);
 extern bool statext_is_kind_built(HeapTuple htup, char kind);
 extern Selectivity dependencies_clauselist_selectivity(PlannerInfo *root,
 													   List *clauses,
@@ -116,9 +116,11 @@ extern Selectivity statext_clauselist_selectivity(PlannerInfo *root,
 												  JoinType jointype,
 												  SpecialJoinInfo *sjinfo,
 												  RelOptInfo *rel,
-												  Bitmapset **estimatedclauses);
+												  Bitmapset **estimatedclauses,
+												  bool is_or);
 extern bool has_stats_of_kind(List *stats, char requiredkind);
-extern StatisticExtInfo *choose_best_statistics(List *stats,
-												Bitmapset *attnums, char requiredkind);
+extern StatisticExtInfo *choose_best_statistics(List *stats, char requiredkind,
+												Bitmapset **clause_attnums,
+												int nclauses);
 
 #endif							/* STATISTICS_H */

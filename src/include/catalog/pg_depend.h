@@ -16,7 +16,7 @@
  * convenient to find from the contents of other catalogs.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_depend.h
@@ -61,6 +61,9 @@ CATALOG(pg_depend,2608,DependRelationId)
 	 * field.  See DependencyType in catalog/dependency.h.
 	 */
 	char		deptype;		/* see codes in dependency.h */
+#ifdef CATALOG_VARLEN
+	text		refobjversion;	/* version of referenced object */
+#endif
 } FormData_pg_depend;
 
 /* ----------------
@@ -69,5 +72,12 @@ CATALOG(pg_depend,2608,DependRelationId)
  * ----------------
  */
 typedef FormData_pg_depend *Form_pg_depend;
+
+DECLARE_TOAST(pg_depend, 8888, 8889);
+
+DECLARE_INDEX(pg_depend_depender_index, 2673, on pg_depend using btree(classid oid_ops, objid oid_ops, objsubid int4_ops));
+#define DependDependerIndexId  2673
+DECLARE_INDEX(pg_depend_reference_index, 2674, on pg_depend using btree(refclassid oid_ops, refobjid oid_ops, refobjsubid int4_ops));
+#define DependReferenceIndexId	2674
 
 #endif							/* PG_DEPEND_H */

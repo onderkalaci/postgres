@@ -3,7 +3,7 @@
  * lockfuncs.c
  *		Functions for SQL access to various lock-manager capabilities.
  *
- * Copyright (c) 2002-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/utils/adt/lockfuncs.c
@@ -22,19 +22,26 @@
 #include "utils/builtins.h"
 
 
-/* This must match enum LockTagType! */
+/*
+ * This must match enum LockTagType!  Also, be sure to document any changes
+ * in the docs for the pg_locks view and for wait event types.
+ */
 const char *const LockTagTypeNames[] = {
 	"relation",
 	"extend",
+	"frozenid",
 	"page",
 	"tuple",
 	"transactionid",
 	"virtualxid",
-	"speculative token",
+	"spectoken",
 	"object",
 	"userlock",
 	"advisory"
 };
+
+StaticAssertDecl(lengthof(LockTagTypeNames) == (LOCKTAG_ADVISORY + 1),
+				 "array length mismatch");
 
 /* This must match enum PredicateLockTargetType (predicate_internals.h) */
 static const char *const PredicateLockTagTypeNames[] = {
@@ -42,6 +49,9 @@ static const char *const PredicateLockTagTypeNames[] = {
 	"page",
 	"tuple"
 };
+
+StaticAssertDecl(lengthof(PredicateLockTagTypeNames) == (PREDLOCKTAG_TUPLE + 1),
+				 "array length mismatch");
 
 /* Working status for pg_lock_status */
 typedef struct
@@ -237,6 +247,17 @@ pg_lock_status(PG_FUNCTION_ARGS)
 			case LOCKTAG_RELATION_EXTEND:
 				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
 				values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+				nulls[3] = true;
+				nulls[4] = true;
+				nulls[5] = true;
+				nulls[6] = true;
+				nulls[7] = true;
+				nulls[8] = true;
+				nulls[9] = true;
+				break;
+			case LOCKTAG_DATABASE_FROZEN_IDS:
+				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+				nulls[2] = true;
 				nulls[3] = true;
 				nulls[4] = true;
 				nulls[5] = true;
@@ -513,7 +534,7 @@ pg_blocking_pids(PG_FUNCTION_ARGS)
 	/* Construct array, using hardwired knowledge about int4 type */
 	PG_RETURN_ARRAYTYPE_P(construct_array(arrayelems, narrayelems,
 										  INT4OID,
-										  sizeof(int32), true, 'i'));
+										  sizeof(int32), true, TYPALIGN_INT));
 }
 
 
@@ -554,7 +575,7 @@ pg_safe_snapshot_blocking_pids(PG_FUNCTION_ARGS)
 	/* Construct array, using hardwired knowledge about int4 type */
 	PG_RETURN_ARRAYTYPE_P(construct_array(blocker_datums, num_blockers,
 										  INT4OID,
-										  sizeof(int32), true, 'i'));
+										  sizeof(int32), true, TYPALIGN_INT));
 }
 
 

@@ -4,7 +4,7 @@
  *	  definitions for query plan nodes
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/plannodes.h
@@ -68,11 +68,7 @@ typedef struct PlannedStmt
 	/* rtable indexes of target relations for INSERT/UPDATE/DELETE */
 	List	   *resultRelations;	/* integer list of RT indexes, or NIL */
 
-	/*
-	 * rtable indexes of partitioned table roots that are UPDATE/DELETE
-	 * targets; needed for trigger firing.
-	 */
-	List	   *rootResultRelations;
+	List	   *appendRelations;	/* list of AppendRelInfo nodes */
 
 	List	   *subplans;		/* Plan trees for SubPlan expressions; note
 								 * that some could be NULL */
@@ -222,8 +218,6 @@ typedef struct ModifyTable
 	Index		rootRelation;	/* Root RT index, if target is partitioned */
 	bool		partColsUpdated;	/* some part key in hierarchy updated */
 	List	   *resultRelations;	/* integer list of RT indexes */
-	int			resultRelIndex; /* index of first resultRel in plan's list */
-	int			rootResultRelIndex; /* index of the partitioned table root */
 	List	   *plans;			/* plan(s) producing source data */
 	List	   *withCheckOptionLists;	/* per-target-table WCO lists */
 	List	   *returningLists; /* per-target-table RETURNING tlists */
@@ -249,6 +243,7 @@ struct PartitionPruneInfo;		/* forward reference to struct below */
 typedef struct Append
 {
 	Plan		plan;
+	Bitmapset  *apprelids;		/* RTIs of appendrel(s) formed by this node */
 	List	   *appendplans;
 
 	/*
@@ -269,6 +264,7 @@ typedef struct Append
 typedef struct MergeAppend
 {
 	Plan		plan;
+	Bitmapset  *apprelids;		/* RTIs of appendrel(s) formed by this node */
 	List	   *mergeplans;
 	/* these fields are just like the sort-key info in struct Sort: */
 	int			numCols;		/* number of sort-key columns */
@@ -603,12 +599,20 @@ typedef struct WorkTableScan
  * When the plan node represents a foreign join, scan.scanrelid is zero and
  * fs_relids must be consulted to identify the join relation.  (fs_relids
  * is valid for simple scans as well, but will always match scan.scanrelid.)
+ *
+ * If the FDW's PlanDirectModify() callback decides to repurpose a ForeignScan
+ * node to perform the UPDATE or DELETE operation directly in the remote
+ * server, it sets 'operation' and 'resultRelation' to identify the operation
+ * type and target relation.  Note that these fields are only set if the
+ * modification is performed *fully* remotely; otherwise, the modification is
+ * driven by a local ModifyTable node and 'operation' is left to CMD_SELECT.
  * ----------------
  */
 typedef struct ForeignScan
 {
 	Scan		scan;
 	CmdType		operation;		/* SELECT/INSERT/UPDATE/DELETE */
+	Index		resultRelation; /* direct modification target's RT index */
 	Oid			fs_server;		/* OID of foreign server */
 	List	   *fdw_exprs;		/* expressions that FDW may evaluate */
 	List	   *fdw_private;	/* private data for FDW */
@@ -770,6 +774,16 @@ typedef struct Sort
 	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
 } Sort;
 
+/* ----------------
+ *		incremental sort node
+ * ----------------
+ */
+typedef struct IncrementalSort
+{
+	Sort		sort;
+	int			nPresortedCols; /* number of presorted columns */
+} IncrementalSort;
+
 /* ---------------
  *	 group node -
  *		Used for queries with GROUP BY (but no aggregates) specified.
@@ -809,6 +823,7 @@ typedef struct Agg
 	Oid		   *grpOperators;	/* equality operators to compare with */
 	Oid		   *grpCollations;
 	long		numGroups;		/* estimated number of groups in input */
+	uint64		transitionSpace;	/* for pass-by-ref transition data */
 	Bitmapset  *aggParams;		/* IDs of Params used in Aggref inputs */
 	/* Note: planner provides numGroups & aggParams only in HASHED/MIXED case */
 	List	   *groupingSets;	/* grouping sets to use */
@@ -967,6 +982,11 @@ typedef struct Limit
 	Plan		plan;
 	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
 	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
+	LimitOption limitOption;	/* limit type */
+	int			uniqNumCols;	/* number of columns to check for similarity  */
+	AttrNumber *uniqColIdx;		/* their indexes in the target list */
+	Oid		   *uniqOperators;	/* equality operators to compare with */
+	Oid		   *uniqCollations; /* collations for equality comparisons */
 } Limit;
 
 

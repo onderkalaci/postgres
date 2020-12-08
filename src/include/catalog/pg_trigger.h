@@ -4,7 +4,7 @@
  *	  definition of the "trigger" system catalog (pg_trigger)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_trigger.h
@@ -35,6 +35,7 @@ CATALOG(pg_trigger,2620,TriggerRelationId)
 {
 	Oid			oid;			/* oid */
 	Oid			tgrelid;		/* relation trigger is attached to */
+	Oid			tgparentid;		/* OID of parent trigger, if any */
 	NameData	tgname;			/* trigger's name */
 	Oid			tgfoid;			/* OID of function to be called */
 	int16		tgtype;			/* BEFORE/AFTER/INSTEAD, UPDATE/DELETE/INSERT,
@@ -53,7 +54,8 @@ CATALOG(pg_trigger,2620,TriggerRelationId)
 	 * Variable-length fields start here, but we allow direct access to
 	 * tgattr. Note: tgattr and tgargs must not be null.
 	 */
-	int2vector	tgattr;			/* column numbers, if trigger is on columns */
+	int2vector	tgattr BKI_FORCE_NOT_NULL;	/* column numbers, if trigger is
+											 * on columns */
 
 #ifdef CATALOG_VARLEN
 	bytea		tgargs BKI_FORCE_NOT_NULL;	/* first\000second\000tgnargs\000 */
@@ -69,6 +71,15 @@ CATALOG(pg_trigger,2620,TriggerRelationId)
  * ----------------
  */
 typedef FormData_pg_trigger *Form_pg_trigger;
+
+DECLARE_TOAST(pg_trigger, 2336, 2337);
+
+DECLARE_INDEX(pg_trigger_tgconstraint_index, 2699, on pg_trigger using btree(tgconstraint oid_ops));
+#define TriggerConstraintIndexId  2699
+DECLARE_UNIQUE_INDEX(pg_trigger_tgrelid_tgname_index, 2701, on pg_trigger using btree(tgrelid oid_ops, tgname name_ops));
+#define TriggerRelidNameIndexId  2701
+DECLARE_UNIQUE_INDEX(pg_trigger_oid_index, 2702, on pg_trigger using btree(oid oid_ops));
+#define TriggerOidIndexId  2702
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 

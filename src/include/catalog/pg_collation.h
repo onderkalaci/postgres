@@ -4,7 +4,7 @@
  *	  definition of the "collation" system catalog (pg_collation)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_collation.h
@@ -37,10 +37,6 @@ CATALOG(pg_collation,3456,CollationRelationId)
 	int32		collencoding;	/* encoding for this collation; -1 = "all" */
 	NameData	collcollate;	/* LC_COLLATE setting */
 	NameData	collctype;		/* LC_CTYPE setting */
-#ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	text		collversion;	/* provider-dependent version of collation
-								 * data */
-#endif
 } FormData_pg_collation;
 
 /* ----------------
@@ -49,6 +45,11 @@ CATALOG(pg_collation,3456,CollationRelationId)
  * ----------------
  */
 typedef FormData_pg_collation *Form_pg_collation;
+
+DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164, on pg_collation using btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops));
+#define CollationNameEncNspIndexId 3164
+DECLARE_UNIQUE_INDEX(pg_collation_oid_index, 3085, on pg_collation using btree(oid oid_ops));
+#define CollationOidIndexId  3085
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
@@ -65,9 +66,7 @@ extern Oid	CollationCreate(const char *collname, Oid collnamespace,
 							bool collisdeterministic,
 							int32 collencoding,
 							const char *collcollate, const char *collctype,
-							const char *collversion,
 							bool if_not_exists,
 							bool quiet);
-extern void RemoveCollationById(Oid collationOid);
 
 #endif							/* PG_COLLATION_H */

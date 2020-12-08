@@ -107,7 +107,7 @@
  * is a convenient point to initialize replication from, which is why we
  * export a snapshot at that point, which *can* be used to read normal data.
  *
- * Copyright (c) 2012-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/snapbuild.c
@@ -524,6 +524,7 @@ SnapBuildBuildSnapshot(SnapBuild *builder)
 	snapshot->curcid = FirstCommandId;
 	snapshot->active_count = 0;
 	snapshot->regd_count = 0;
+	snapshot->snapXactCompletionCount = 0;
 
 	return snapshot;
 }
@@ -553,8 +554,8 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 		elog(ERROR, "cannot build an initial slot snapshot, not all transactions are monitored anymore");
 
 	/* so we don't overwrite the existing value */
-	if (TransactionIdIsValid(MyPgXact->xmin))
-		elog(ERROR, "cannot build an initial slot snapshot when MyPgXact->xmin already is valid");
+	if (TransactionIdIsValid(MyProc->xmin))
+		elog(ERROR, "cannot build an initial slot snapshot when MyProc->xmin already is valid");
 
 	snap = SnapBuildBuildSnapshot(builder);
 
@@ -575,7 +576,7 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 	}
 #endif
 
-	MyPgXact->xmin = snap->xmin;
+	MyProc->xmin = snap->xmin;
 
 	/* allocate in transaction context */
 	newxip = (TransactionId *)

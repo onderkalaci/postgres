@@ -22,7 +22,7 @@ sub _new
 	my $self = {
 		name                  => $name,
 		type                  => $type,
-		guid                  => Win32::GuidGen(),
+		guid                  => $^O eq "MSWin32" ? Win32::GuidGen() : 'FAKE',
 		files                 => {},
 		references            => [],
 		libraries             => [],
@@ -338,6 +338,14 @@ sub AddResourceFile
 			if ($self->{type} eq "dll")
 			{
 				s/VFT_APP/VFT_DLL/gm;
+				my $name = $self->{name};
+				s/_INTERNAL_NAME_/"$name"/;
+				s/_ORIGINAL_NAME_/"$name.dll"/;
+			}
+			else
+			{
+				/_INTERNAL_NAME_/ && next;
+				/_ORIGINAL_NAME_/ && next;
 			}
 			print $o $_;
 		}
@@ -412,13 +420,10 @@ sub read_file
 {
 	my $filename = shift;
 	my $F;
-	my $t = $/;
-
-	undef $/;
+	local $/ = undef;
 	open($F, '<', $filename) || croak "Could not open file $filename\n";
 	my $txt = <$F>;
 	close($F);
-	$/ = $t;
 
 	return $txt;
 }
@@ -427,15 +432,12 @@ sub read_makefile
 {
 	my $reldir = shift;
 	my $F;
-	my $t = $/;
-
-	undef $/;
+	local $/ = undef;
 	open($F, '<', "$reldir/GNUmakefile")
 	  || open($F, '<', "$reldir/Makefile")
 	  || confess "Could not open $reldir/Makefile\n";
 	my $txt = <$F>;
 	close($F);
-	$/ = $t;
 
 	return $txt;
 }

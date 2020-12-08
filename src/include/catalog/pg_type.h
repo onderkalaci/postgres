@@ -4,7 +4,7 @@
  *	  definition of the "type" system catalog (pg_type)
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_type.h
@@ -155,6 +155,7 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
 	 * 's' = SHORT alignment (2 bytes on most machines).
 	 * 'i' = INT alignment (4 bytes on most machines).
 	 * 'd' = DOUBLE alignment (8 bytes on many machines, but by no means all).
+	 * (Use the TYPALIGN macros below for these.)
 	 *
 	 * See include/access/tupmacs.h for the macros that compute these
 	 * alignment requirements.  Note also that we allow the nominal alignment
@@ -176,6 +177,10 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
 	 * 'e' EXTERNAL   external storage possible, don't try to compress
 	 * 'x' EXTENDED   try to compress and store external if required
 	 * 'm' MAIN		  like 'x' but try to keep in main tuple
+	 * (Use the TYPSTORAGE macros below for these.)
+	 *
+	 * Note that 'm' fields can also be moved out to secondary storage,
+	 * but only as a last resort ('e' and 'x' fields are moved first).
 	 * ----------------
 	 */
 	char		typstorage BKI_DEFAULT(p) BKI_ARRAY_DEFAULT(x);
@@ -249,6 +254,13 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
  */
 typedef FormData_pg_type *Form_pg_type;
 
+DECLARE_TOAST(pg_type, 4171, 4172);
+
+DECLARE_UNIQUE_INDEX(pg_type_oid_index, 2703, on pg_type using btree(oid oid_ops));
+#define TypeOidIndexId	2703
+DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, on pg_type using btree(typname name_ops, typnamespace oid_ops));
+#define TypeNameNspIndexId	2704
+
 #ifdef EXPOSE_TO_CLIENT_CODE
 
 /*
@@ -278,13 +290,41 @@ typedef FormData_pg_type *Form_pg_type;
 #define  TYPCATEGORY_BITSTRING	'V' /* er ... "varbit"? */
 #define  TYPCATEGORY_UNKNOWN	'X'
 
+#define  TYPALIGN_CHAR			'c' /* char alignment (i.e. unaligned) */
+#define  TYPALIGN_SHORT			's' /* short alignment (typically 2 bytes) */
+#define  TYPALIGN_INT			'i' /* int alignment (typically 4 bytes) */
+#define  TYPALIGN_DOUBLE		'd' /* double alignment (often 8 bytes) */
+
+#define  TYPSTORAGE_PLAIN		'p' /* type not prepared for toasting */
+#define  TYPSTORAGE_EXTERNAL	'e' /* toastable, don't try to compress */
+#define  TYPSTORAGE_EXTENDED	'x' /* fully toastable */
+#define  TYPSTORAGE_MAIN		'm' /* like 'x' but try to store inline */
+
 /* Is a type OID a polymorphic pseudotype?	(Beware of multiple evaluation) */
 #define IsPolymorphicType(typid)  \
+	(IsPolymorphicTypeFamily1(typid) || \
+	 IsPolymorphicTypeFamily2(typid))
+
+/* Code not part of polymorphic type resolution should not use these macros: */
+#define IsPolymorphicTypeFamily1(typid)  \
 	((typid) == ANYELEMENTOID || \
 	 (typid) == ANYARRAYOID || \
 	 (typid) == ANYNONARRAYOID || \
 	 (typid) == ANYENUMOID || \
 	 (typid) == ANYRANGEOID)
+
+#define IsPolymorphicTypeFamily2(typid)  \
+	((typid) == ANYCOMPATIBLEOID || \
+	 (typid) == ANYCOMPATIBLEARRAYOID || \
+	 (typid) == ANYCOMPATIBLENONARRAYOID || \
+	 (typid) == ANYCOMPATIBLERANGEOID)
+
+/*
+ * Backwards compatibility for ancient random spellings of pg_type OID macros.
+ * Don't use these names in new code.
+ */
+#define CASHOID	MONEYOID
+#define LSNOID	PG_LSNOID
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 
@@ -325,8 +365,8 @@ extern ObjectAddress TypeCreate(Oid newTypeOid,
 								bool typeNotNull,
 								Oid typeCollation);
 
-extern void GenerateTypeDependencies(Oid typeObjectId,
-									 Form_pg_type typeForm,
+extern void GenerateTypeDependencies(HeapTuple typeTuple,
+									 Relation typeCatalog,
 									 Node *defaultExpr,
 									 void *typacl,
 									 char relationKind, /* only for relation
@@ -334,6 +374,8 @@ extern void GenerateTypeDependencies(Oid typeObjectId,
 									 bool isImplicitArray,
 									 bool isDependentType,
 									 bool rebuild);
+
+extern List *GetTypeCollations(Oid typeObjectid);
 
 extern void RenameTypeInternal(Oid typeOid, const char *newTypeName,
 							   Oid typeNamespace);

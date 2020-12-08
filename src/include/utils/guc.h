@@ -4,7 +4,7 @@
  * External declarations pertaining to backend/utils/misc/guc.c and
  * backend/utils/misc/guc-file.l
  *
- * Copyright (c) 2000-2019, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2020, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * src/include/utils/guc.h
@@ -155,6 +155,7 @@ extern bool ParseConfigDirectory(const char *includedir,
 								 ConfigVariable **head_p,
 								 ConfigVariable **tail_p);
 extern void FreeConfigVariables(ConfigVariable *list);
+extern char *DeescapeQuotedString(const char *s);
 
 /*
  * The possible values of an enum variable are specified by an array of
@@ -233,7 +234,6 @@ typedef enum
 
 
 /* GUC vars that are actually declared in guc.c, rather than elsewhere */
-extern bool log_duration;
 extern bool Debug_print_plan;
 extern bool Debug_print_parse;
 extern bool Debug_print_rewritten;
@@ -248,6 +248,9 @@ extern bool log_btree_build_stats;
 extern PGDLLIMPORT bool check_function_bodies;
 extern bool session_auth_is_superuser;
 
+extern bool log_duration;
+extern int	log_parameter_max_length;
+extern int	log_parameter_max_length_on_error;
 extern int	log_min_error_statement;
 extern PGDLLIMPORT int log_min_messages;
 extern PGDLLIMPORT int client_min_messages;
@@ -360,6 +363,7 @@ extern void AtStart_GUC(void);
 extern int	NewGUCNestLevel(void);
 extern void AtEOXact_GUC(bool isCommit, int nestLevel);
 extern void BeginReportingGUCOptions(void);
+extern void ReportChangedGUCOptions(void);
 extern void ParseLongOption(const char *string, char **name, char **value);
 extern bool parse_int(const char *value, int *result, int flags,
 					  const char **hintmsg);

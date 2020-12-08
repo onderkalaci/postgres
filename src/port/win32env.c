@@ -4,7 +4,7 @@
  *	  putenv() and unsetenv() for win32, which update both process environment
  *	  and caches in (potentially multiple) C run-time library (CRT) versions.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -95,7 +95,7 @@ pgwin32_putenv(const char *envval)
 		{
 			PUTENVPROC	putenvFunc;
 
-			putenvFunc = (PUTENVPROC) GetProcAddress(hmodule, "_putenv");
+			putenvFunc = (PUTENVPROC) (pg_funcptr_t) GetProcAddress(hmodule, "_putenv");
 			if (putenvFunc)
 				putenvFunc(envval);
 			FreeLibrary(hmodule);

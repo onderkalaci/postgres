@@ -2,7 +2,7 @@
  * oracle_compat.c
  *	Oracle compatible functions.
  *
- * Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2020, PostgreSQL Global Development Group
  *
  *	Author: Edmund Mergl <E.Mergl@bawue.de>
  *	Multibyte enhancement: Tatsuo Ishii <ishii@postgresql.org>
@@ -17,6 +17,7 @@
 
 #include "common/int.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/formatting.h"
 
@@ -1061,6 +1062,7 @@ repeat(PG_FUNCTION_ARGS)
 	{
 		memcpy(cp, sp, slen);
 		cp += slen;
+		CHECK_FOR_INTERRUPTS();
 	}
 
 	PG_RETURN_TEXT_P(result);

@@ -9,7 +9,7 @@
  * of XLogRecData structs by a call to XLogRecordAssemble(). See
  * access/transam/README for details.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xloginsert.c
@@ -25,6 +25,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "replication/origin.h"
@@ -88,11 +89,13 @@ static XLogRecData hdr_rdt;
 static char *hdr_scratch = NULL;
 
 #define SizeOfXlogOrigin	(sizeof(RepOriginId) + sizeof(char))
+#define SizeOfXLogTransactionId	(sizeof(TransactionId) + sizeof(char))
 
 #define HEADER_SCRATCH_SIZE \
 	(SizeOfXLogRecord + \
 	 MaxSizeOfXLogRecordBlockHeader * (XLR_MAX_BLOCK_ID + 1) + \
-	 SizeOfXLogRecordDataHeaderLong + SizeOfXlogOrigin)
+	 SizeOfXLogRecordDataHeaderLong + SizeOfXlogOrigin + \
+	 SizeOfXLogTransactionId)
 
 /*
  * An array of XLogRecData structs, to hold registered data.
@@ -108,7 +111,7 @@ static MemoryContext xloginsert_cxt;
 
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
-									   XLogRecPtr *fpw_lsn);
+									   XLogRecPtr *fpw_lsn, int *num_fpi);
 static bool XLogCompressBackupBlock(char *page, uint16 hole_offset,
 									uint16 hole_length, char *dest, uint16 *dlen);
 
@@ -193,6 +196,10 @@ void
 XLogResetInsertion(void)
 {
 	int			i;
+
+	/* reset the subxact assignment flag (if needed) */
+	if (curinsert_flags & XLOG_INCLUDE_XID)
+		MarkSubTransactionAssigned();
 
 	for (i = 0; i < max_registered_block_id; i++)
 		registered_buffers[i].in_use = false;
@@ -397,7 +404,7 @@ void
 XLogSetRecordFlags(uint8 flags)
 {
 	Assert(begininsert_called);
-	curinsert_flags = flags;
+	curinsert_flags |= flags;
 }
 
 /*
@@ -448,6 +455,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 		bool		doPageWrites;
 		XLogRecPtr	fpw_lsn;
 		XLogRecData *rdt;
+		int			num_fpi = 0;
 
 		/*
 		 * Get values needed to decide whether to do full-page writes. Since
@@ -457,9 +465,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
 		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-								 &fpw_lsn);
+								 &fpw_lsn, &num_fpi);
 
-		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags);
+		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi);
 	} while (EndPos == InvalidXLogRecPtr);
 
 	XLogResetInsertion();
@@ -482,7 +490,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 static XLogRecData *
 XLogRecordAssemble(RmgrId rmid, uint8 info,
 				   XLogRecPtr RedoRecPtr, bool doPageWrites,
-				   XLogRecPtr *fpw_lsn)
+				   XLogRecPtr *fpw_lsn, int *num_fpi)
 {
 	XLogRecData *rdt;
 	uint32		total_len = 0;
@@ -635,6 +643,9 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			 */
 			bkpb.fork_flags |= BKPBLOCK_HAS_IMAGE;
 
+			/* Report a full page image constructed for the WAL record */
+			*num_fpi += 1;
+
 			/*
 			 * Construct XLogRecData entries for the page content.
 			 */
@@ -741,6 +752,19 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		*(scratch++) = (char) XLR_BLOCK_ID_ORIGIN;
 		memcpy(scratch, &replorigin_session_origin, sizeof(replorigin_session_origin));
 		scratch += sizeof(replorigin_session_origin);
+	}
+
+	/* followed by toplevel XID, if not already included in previous record */
+	if (IsSubTransactionAssignmentPending())
+	{
+		TransactionId xid = GetTopTransactionIdIfAny();
+
+		/* update the flag (later used by XLogResetInsertion) */
+		XLogSetRecordFlags(XLOG_INCLUDE_XID);
+
+		*(scratch++) = (char) XLR_BLOCK_ID_TOPLEVEL_XID;
+		memcpy(scratch, &xid, sizeof(TransactionId));
+		scratch += sizeof(TransactionId);
 	}
 
 	/* followed by main data, if any */
@@ -899,7 +923,7 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 	/*
 	 * Ensure no checkpoint can change our view of RedoRecPtr.
 	 */
-	Assert(MyPgXact->delayChkpt);
+	Assert(MyProc->delayChkpt);
 
 	/*
 	 * Update RedoRecPtr so that we can make the right decision
@@ -996,6 +1020,63 @@ log_newpage(RelFileNode *rnode, ForkNumber forkNum, BlockNumber blkno,
 }
 
 /*
+ * Like log_newpage(), but allows logging multiple pages in one operation.
+ * It is more efficient than calling log_newpage() for each page separately,
+ * because we can write multiple pages in a single WAL record.
+ */
+void
+log_newpages(RelFileNode *rnode, ForkNumber forkNum, int num_pages,
+			 BlockNumber *blknos, Page *pages, bool page_std)
+{
+	int			flags;
+	XLogRecPtr	recptr;
+	int			i;
+	int			j;
+
+	flags = REGBUF_FORCE_IMAGE;
+	if (page_std)
+		flags |= REGBUF_STANDARD;
+
+	/*
+	 * Iterate over all the pages. They are collected into batches of
+	 * XLR_MAX_BLOCK_ID pages, and a single WAL-record is written for each
+	 * batch.
+	 */
+	XLogEnsureRecordSpace(XLR_MAX_BLOCK_ID - 1, 0);
+
+	i = 0;
+	while (i < num_pages)
+	{
+		int			batch_start = i;
+		int			nbatch;
+
+		XLogBeginInsert();
+
+		nbatch = 0;
+		while (nbatch < XLR_MAX_BLOCK_ID && i < num_pages)
+		{
+			XLogRegisterBlock(nbatch, rnode, forkNum, blknos[i], pages[i], flags);
+			i++;
+			nbatch++;
+		}
+
+		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+
+		for (j = batch_start; j < i; j++)
+		{
+			/*
+			 * The page may be uninitialized. If so, we can't set the LSN because that
+			 * would corrupt the page.
+			 */
+			if (!PageIsNew(pages[j]))
+			{
+				PageSetLSN(pages[j], recptr);
+			}
+		}
+	}
+}
+
+/*
  * Write a WAL record containing a full image of a page.
  *
  * Caller should initialize the buffer and mark it dirty before calling this
@@ -1043,7 +1124,12 @@ log_newpage_range(Relation rel, ForkNumber forkNum,
 				  BlockNumber startblk, BlockNumber endblk,
 				  bool page_std)
 {
+	int			flags;
 	BlockNumber blkno;
+
+	flags = REGBUF_FORCE_IMAGE;
+	if (page_std)
+		flags |= REGBUF_STANDARD;
 
 	/*
 	 * Iterate over all the pages in the range. They are collected into
@@ -1066,7 +1152,8 @@ log_newpage_range(Relation rel, ForkNumber forkNum,
 		nbufs = 0;
 		while (nbufs < XLR_MAX_BLOCK_ID && blkno < endblk)
 		{
-			Buffer		buf = ReadBuffer(rel, blkno);
+			Buffer		buf = ReadBufferExtended(rel, forkNum, blkno,
+												 RBM_NORMAL, NULL);
 
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
@@ -1088,7 +1175,7 @@ log_newpage_range(Relation rel, ForkNumber forkNum,
 		START_CRIT_SECTION();
 		for (i = 0; i < nbufs; i++)
 		{
-			XLogRegisterBuffer(i, bufpack[i], REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+			XLogRegisterBuffer(i, bufpack[i], flags);
 			MarkBufferDirty(bufpack[i]);
 		}
 

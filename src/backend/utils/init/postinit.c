@@ -3,7 +3,7 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -28,7 +28,6 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/catalog.h"
-#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
@@ -236,6 +235,7 @@ PerformAuthentication(Port *port)
 	/*
 	 * Now perform authentication exchange.
 	 */
+	set_ps_display("authentication");
 	ClientAuthentication(port); /* might not return, if failure */
 
 	/*
@@ -245,65 +245,43 @@ PerformAuthentication(Port *port)
 
 	if (Log_connections)
 	{
+		StringInfoData logmsg;
+
+		initStringInfo(&logmsg);
 		if (am_walsender)
-		{
-#ifdef USE_SSL
-			if (port->ssl_in_use)
-				ereport(LOG,
-						(port->application_name != NULL
-						 ? errmsg("replication connection authorized: user=%s application_name=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
-								  port->user_name,
-								  port->application_name,
-								  be_tls_get_version(port),
-								  be_tls_get_cipher(port),
-								  be_tls_get_cipher_bits(port),
-								  be_tls_get_compression(port) ? _("on") : _("off"))
-						 : errmsg("replication connection authorized: user=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
-								  port->user_name,
-								  be_tls_get_version(port),
-								  be_tls_get_cipher(port),
-								  be_tls_get_cipher_bits(port),
-								  be_tls_get_compression(port) ? _("on") : _("off"))));
-			else
-#endif
-				ereport(LOG,
-						(port->application_name != NULL
-						 ? errmsg("replication connection authorized: user=%s application_name=%s",
-								  port->user_name,
-								  port->application_name)
-						 : errmsg("replication connection authorized: user=%s",
-								  port->user_name)));
-		}
+			appendStringInfo(&logmsg, _("replication connection authorized: user=%s"),
+							 port->user_name);
 		else
-		{
+			appendStringInfo(&logmsg, _("connection authorized: user=%s"),
+							 port->user_name);
+		if (!am_walsender)
+			appendStringInfo(&logmsg, _(" database=%s"), port->database_name);
+
+		if (port->application_name != NULL)
+			appendStringInfo(&logmsg, _(" application_name=%s"),
+							 port->application_name);
+
 #ifdef USE_SSL
-			if (port->ssl_in_use)
-				ereport(LOG,
-						(port->application_name != NULL
-						 ? errmsg("connection authorized: user=%s database=%s application_name=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
-								  port->user_name, port->database_name, port->application_name,
-								  be_tls_get_version(port),
-								  be_tls_get_cipher(port),
-								  be_tls_get_cipher_bits(port),
-								  be_tls_get_compression(port) ? _("on") : _("off"))
-						 : errmsg("connection authorized: user=%s database=%s SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)",
-								  port->user_name, port->database_name,
-								  be_tls_get_version(port),
-								  be_tls_get_cipher(port),
-								  be_tls_get_cipher_bits(port),
-								  be_tls_get_compression(port) ? _("on") : _("off"))));
-			else
+		if (port->ssl_in_use)
+			appendStringInfo(&logmsg, _(" SSL enabled (protocol=%s, cipher=%s, bits=%d, compression=%s)"),
+							 be_tls_get_version(port),
+							 be_tls_get_cipher(port),
+							 be_tls_get_cipher_bits(port),
+							 be_tls_get_compression(port) ? _("on") : _("off"));
 #endif
-				ereport(LOG,
-						(port->application_name != NULL
-						 ? errmsg("connection authorized: user=%s database=%s application_name=%s",
-								  port->user_name, port->database_name, port->application_name)
-						 : errmsg("connection authorized: user=%s database=%s",
-								  port->user_name, port->database_name)));
-		}
+#ifdef ENABLE_GSS
+		if (be_gssapi_get_princ(port))
+			appendStringInfo(&logmsg, _(" GSS (authenticated=%s, encrypted=%s, principal=%s)"),
+							 be_gssapi_get_auth(port) ? _("yes") : _("no"),
+							 be_gssapi_get_enc(port) ? _("yes") : _("no"),
+							 be_gssapi_get_princ(port));
+#endif
+
+		ereport(LOG, errmsg_internal("%s", logmsg.data));
+		pfree(logmsg.data);
 	}
 
-	set_ps_display("startup", false);
+	set_ps_display("startup");
 
 	ClientAuthInProgress = false;	/* client_min_messages is active now */
 }
@@ -721,6 +699,10 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * is critical for anything that reads heap pages, because HOT may decide
 	 * to prune them even if the process doesn't attempt to modify any
 	 * tuples.)
+	 *
+	 * FIXME: This comment is inaccurate / the code buggy. A snapshot that is
+	 * not pushed/active does not reliably prevent HOT pruning (->xmin could
+	 * e.g. be cleared when cache invalidations are processed).
 	 */
 	if (!bootstrap)
 	{
@@ -790,7 +772,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 */
 	if ((!am_superuser || am_walsender) &&
 		MyProcPort != NULL &&
-		MyProcPort->canAcceptConnections == CAC_WAITBACKUP)
+		MyProcPort->canAcceptConnections == CAC_SUPERUSER)
 	{
 		if (am_walsender)
 			ereport(FATAL,

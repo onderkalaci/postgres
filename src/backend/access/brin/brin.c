@@ -4,7 +4,7 @@
  *
  * See src/backend/access/brin/README for details.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,11 +27,13 @@
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
@@ -88,6 +90,7 @@ brinhandler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = 0;
 	amroutine->amsupport = BRIN_LAST_OPTIONAL_PROCNUM;
+	amroutine->amoptsprocnum = BRIN_PROCNUM_OPTIONS;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
@@ -101,6 +104,9 @@ brinhandler(PG_FUNCTION_ARGS)
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
 	amroutine->amcaninclude = false;
+	amroutine->amusemaintenanceworkmem = false;
+	amroutine->amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_CLEANUP;
 	amroutine->amkeytype = InvalidOid;
 
 	amroutine->ambuild = brinbuild;
@@ -114,6 +120,7 @@ brinhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = brinvalidate;
+	amroutine->amadjustmembers = NULL;
 	amroutine->ambeginscan = brinbeginscan;
 	amroutine->amrescan = brinrescan;
 	amroutine->amgettuple = NULL;

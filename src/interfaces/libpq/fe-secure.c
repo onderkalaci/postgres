@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -261,15 +261,13 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 				/* no error message, caller is expected to retry */
 				break;
 
-#ifdef ECONNRESET
+			case EPIPE:
 			case ECONNRESET:
 				printfPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext(
-												"server closed the connection unexpectedly\n"
+								  libpq_gettext("server closed the connection unexpectedly\n"
 												"\tThis probably means the server terminated abnormally\n"
 												"\tbefore or while processing the request.\n"));
 				break;
-#endif
 
 			default:
 				printfPQExpBuffer(&conn->errorMessage,
@@ -375,14 +373,11 @@ retry_masked:
 				/* Set flag for EPIPE */
 				REMEMBER_EPIPE(spinfo, true);
 
-#ifdef ECONNRESET
 				/* FALL THRU */
 
 			case ECONNRESET:
-#endif
 				printfPQExpBuffer(&conn->errorMessage,
-								  libpq_gettext(
-												"server closed the connection unexpectedly\n"
+								  libpq_gettext("server closed the connection unexpectedly\n"
 												"\tThis probably means the server terminated abnormally\n"
 												"\tbefore or while processing the request.\n"));
 				break;
@@ -431,6 +426,24 @@ PQsslAttributeNames(PGconn *conn)
 	static const char *const result[] = {NULL};
 
 	return result;
+}
+
+PQsslKeyPassHook_OpenSSL_type
+PQgetSSLKeyPassHook_OpenSSL(void)
+{
+	return NULL;
+}
+
+void
+PQsetSSLKeyPassHook_OpenSSL(PQsslKeyPassHook_OpenSSL_type hook)
+{
+	return;
+}
+
+int
+PQdefaultSSLKeyPassHook_OpenSSL(char *buf, int size, PGconn *conn)
+{
+	return 0;
 }
 #endif							/* USE_SSL */
 

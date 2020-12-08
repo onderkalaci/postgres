@@ -3,7 +3,7 @@
  * lmgr.c
  *	  POSTGRES lock manager code
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -458,6 +458,21 @@ UnlockRelationForExtension(Relation relation, LOCKMODE lockmode)
 								relation->rd_lockInfo.lockRelId.relId);
 
 	LockRelease(&tag, lockmode, false);
+}
+
+/*
+ *		LockDatabaseFrozenIds
+ *
+ * This allows one backend per database to execute vac_update_datfrozenxid().
+ */
+void
+LockDatabaseFrozenIds(LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_DATABASE_FROZEN_IDS(tag, MyDatabaseId);
+
+	(void) LockAcquire(&tag, lockmode, false, false);
 }
 
 /*
@@ -1096,6 +1111,11 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 			appendStringInfo(buf,
 							 _("extension of relation %u of database %u"),
 							 tag->locktag_field2,
+							 tag->locktag_field1);
+			break;
+		case LOCKTAG_DATABASE_FROZEN_IDS:
+			appendStringInfo(buf,
+							 _("pg_database.datfrozenxid of database %u"),
 							 tag->locktag_field1);
 			break;
 		case LOCKTAG_PAGE:

@@ -3,7 +3,7 @@
  * xactdesc.c
  *	  rmgr descriptor routines for access/transam/xact.c
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -251,7 +251,7 @@ static void
 xact_desc_relations(StringInfo buf, char *label, int nrels,
 					RelFileNode *xnodes)
 {
-	int		i;
+	int			i;
 
 	if (nrels > 0)
 	{
@@ -269,7 +269,7 @@ xact_desc_relations(StringInfo buf, char *label, int nrels,
 static void
 xact_desc_subxacts(StringInfo buf, int nsubxacts, TransactionId *subxacts)
 {
-	int		i;
+	int			i;
 
 	if (nsubxacts > 0)
 	{
@@ -295,9 +295,9 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 	xact_desc_relations(buf, "rels", parsed.nrels, parsed.xnodes);
 	xact_desc_subxacts(buf, parsed.nsubxacts, parsed.subxacts);
 
-	standby_desc_invalidations(
-						buf, parsed.nmsgs, parsed.msgs, parsed.dbId, parsed.tsId,
-						XactCompletionRelcacheInitFileInval(parsed.xinfo));
+	standby_desc_invalidations(buf, parsed.nmsgs, parsed.msgs, parsed.dbId,
+							   parsed.tsId,
+							   XactCompletionRelcacheInitFileInval(parsed.xinfo));
 
 	if (XactCompletionForceSyncCommit(parsed.xinfo))
 		appendStringInfoString(buf, "; sync");
@@ -344,9 +344,8 @@ xact_desc_prepare(StringInfo buf, uint8 info, xl_xact_prepare *xlrec)
 						parsed.abortnodes);
 	xact_desc_subxacts(buf, parsed.nsubxacts, parsed.subxacts);
 
-	standby_desc_invalidations(
-						buf, parsed.nmsgs, parsed.msgs, parsed.dbId, parsed.tsId,
-						xlrec->initfileinval);
+	standby_desc_invalidations(buf, parsed.nmsgs, parsed.msgs, parsed.dbId,
+							   parsed.tsId, xlrec->initfileinval);
 }
 
 static void
@@ -397,6 +396,13 @@ xact_desc(StringInfo buf, XLogReaderState *record)
 		appendStringInfo(buf, "xtop %u: ", xlrec->xtop);
 		xact_desc_assignment(buf, xlrec);
 	}
+	else if (info == XLOG_XACT_INVALIDATIONS)
+	{
+		xl_xact_invals *xlrec = (xl_xact_invals *) rec;
+
+		standby_desc_invalidations(buf, xlrec->nmsgs, xlrec->msgs, InvalidOid,
+								   InvalidOid, false);
+	}
 }
 
 const char *
@@ -423,6 +429,9 @@ xact_identify(uint8 info)
 			break;
 		case XLOG_XACT_ASSIGNMENT:
 			id = "ASSIGNMENT";
+			break;
+		case XLOG_XACT_INVALIDATIONS:
+			id = "INVALIDATION";
 			break;
 	}
 

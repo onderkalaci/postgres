@@ -3,7 +3,7 @@
  * basebackup.h
  *	  Exports from replication/basebackup.c.
  *
- * Portions Copyright (c) 2010-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2020, PostgreSQL Global Development Group
  *
  * src/include/replication/basebackup.h
  *
@@ -20,7 +20,6 @@
 #define MAX_RATE_LOWER	32
 #define MAX_RATE_UPPER	1048576
 
-
 typedef struct
 {
 	char	   *oid;
@@ -30,7 +29,5 @@ typedef struct
 } tablespaceinfo;
 
 extern void SendBaseBackup(BaseBackupCmd *cmd);
-
-extern int64 sendTablespace(char *path, bool sizeonly);
 
 #endif							/* _BASEBACKUP_H */

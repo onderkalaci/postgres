@@ -7,7 +7,7 @@
  * type.
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -46,11 +46,9 @@
 
 #include "postgres.h"
 
+#include "port/pg_bitutils.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
-
-/* Define this to detail debug alloc information */
-/* #define HAVE_ALLOCINFO */
 
 /*--------------------
  * Chunk freelist k holds chunks of size 1 << (k + ALLOC_MINBITS),
@@ -297,33 +295,6 @@ static const MemoryContextMethods AllocSetMethods = {
 #endif
 };
 
-/*
- * Table for AllocSetFreeIndex
- */
-#define LT16(n) n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n
-
-static const unsigned char LogTable256[256] =
-{
-	0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
-	LT16(5), LT16(6), LT16(6), LT16(7), LT16(7), LT16(7), LT16(7),
-	LT16(8), LT16(8), LT16(8), LT16(8), LT16(8), LT16(8), LT16(8), LT16(8)
-};
-
-/* ----------
- * Debug macros
- * ----------
- */
-#ifdef HAVE_ALLOCINFO
-#define AllocFreeInfo(_cxt, _chunk) \
-			fprintf(stderr, "AllocFree: %s: %p, %zu\n", \
-				(_cxt)->header.name, (_chunk), (_chunk)->size)
-#define AllocAllocInfo(_cxt, _chunk) \
-			fprintf(stderr, "AllocAlloc: %s: %p, %zu\n", \
-				(_cxt)->header.name, (_chunk), (_chunk)->size)
-#else
-#define AllocFreeInfo(_cxt, _chunk)
-#define AllocAllocInfo(_cxt, _chunk)
-#endif
 
 /* ----------
  * AllocSetFreeIndex -
@@ -337,24 +308,41 @@ static inline int
 AllocSetFreeIndex(Size size)
 {
 	int			idx;
-	unsigned int t,
-				tsize;
 
 	if (size > (1 << ALLOC_MINBITS))
 	{
-		tsize = (size - 1) >> ALLOC_MINBITS;
-
-		/*
-		 * At this point we need to obtain log2(tsize)+1, ie, the number of
-		 * not-all-zero bits at the right.  We used to do this with a
-		 * shift-and-count loop, but this function is enough of a hotspot to
-		 * justify micro-optimization effort.  The best approach seems to be
-		 * to use a lookup table.  Note that this code assumes that
-		 * ALLOCSET_NUM_FREELISTS <= 17, since we only cope with two bytes of
-		 * the tsize value.
+		/*----------
+		 * At this point we must compute ceil(log2(size >> ALLOC_MINBITS)).
+		 * This is the same as
+		 *		pg_leftmost_one_pos32((size - 1) >> ALLOC_MINBITS) + 1
+		 * or equivalently
+		 *		pg_leftmost_one_pos32(size - 1) - ALLOC_MINBITS + 1
+		 *
+		 * However, rather than just calling that function, we duplicate the
+		 * logic here, allowing an additional optimization.  It's reasonable
+		 * to assume that ALLOC_CHUNK_LIMIT fits in 16 bits, so we can unroll
+		 * the byte-at-a-time loop in pg_leftmost_one_pos32 and just handle
+		 * the last two bytes.
+		 *
+		 * Yes, this function is enough of a hot-spot to make it worth this
+		 * much trouble.
+		 *----------
 		 */
+#ifdef HAVE__BUILTIN_CLZ
+		idx = 31 - __builtin_clz((uint32) size - 1) - ALLOC_MINBITS + 1;
+#else
+		uint32		t,
+					tsize;
+
+		/* Statically assert that we only have a 16-bit input value. */
+		StaticAssertStmt(ALLOC_CHUNK_LIMIT < (1 << 16),
+						 "ALLOC_CHUNK_LIMIT must be less than 64kB");
+
+		tsize = size - 1;
 		t = tsize >> 8;
-		idx = t ? LogTable256[t] + 8 : LogTable256[tsize];
+		idx = t ? pg_leftmost_one_pos[t] + 8 : pg_leftmost_one_pos[tsize];
+		idx -= ALLOC_MINBITS - 1;
+#endif
 
 		Assert(idx < ALLOCSET_NUM_FREELISTS);
 	}
@@ -572,7 +560,7 @@ AllocSetReset(MemoryContext context)
 	AllocSet	set = (AllocSet) context;
 	AllocBlock	block;
 	Size		keepersize PG_USED_FOR_ASSERTS_ONLY
-		= set->keeper->endptr - ((char *) set);
+	= set->keeper->endptr - ((char *) set);
 
 	AssertArg(AllocSetIsValid(set));
 
@@ -611,7 +599,7 @@ AllocSetReset(MemoryContext context)
 		else
 		{
 			/* Normal case, release the block */
-			context->mem_allocated -= block->endptr - ((char*) block);
+			context->mem_allocated -= block->endptr - ((char *) block);
 
 #ifdef CLOBBER_FREED_MEMORY
 			wipe_mem(block, block->freeptr - ((char *) block));
@@ -640,7 +628,7 @@ AllocSetDelete(MemoryContext context)
 	AllocSet	set = (AllocSet) context;
 	AllocBlock	block = set->blocks;
 	Size		keepersize PG_USED_FOR_ASSERTS_ONLY
-		= set->keeper->endptr - ((char *) set);
+	= set->keeper->endptr - ((char *) set);
 
 	AssertArg(AllocSetIsValid(set));
 
@@ -790,8 +778,6 @@ AllocSetAlloc(MemoryContext context, Size size)
 			set->blocks = block;
 		}
 
-		AllocAllocInfo(set, chunk);
-
 		/* Ensure any padding bytes are marked NOACCESS. */
 		VALGRIND_MAKE_MEM_NOACCESS((char *) AllocChunkGetPointer(chunk) + size,
 								   chunk_size - size);
@@ -828,8 +814,6 @@ AllocSetAlloc(MemoryContext context, Size size)
 		/* fill the allocated space with junk */
 		randomize_mem((char *) AllocChunkGetPointer(chunk), size);
 #endif
-
-		AllocAllocInfo(set, chunk);
 
 		/* Ensure any padding bytes are marked NOACCESS. */
 		VALGRIND_MAKE_MEM_NOACCESS((char *) AllocChunkGetPointer(chunk) + size,
@@ -990,8 +974,6 @@ AllocSetAlloc(MemoryContext context, Size size)
 	randomize_mem((char *) AllocChunkGetPointer(chunk), size);
 #endif
 
-	AllocAllocInfo(set, chunk);
-
 	/* Ensure any padding bytes are marked NOACCESS. */
 	VALGRIND_MAKE_MEM_NOACCESS((char *) AllocChunkGetPointer(chunk) + size,
 							   chunk_size - size);
@@ -1014,8 +996,6 @@ AllocSetFree(MemoryContext context, void *pointer)
 
 	/* Allow access to private part of chunk header. */
 	VALGRIND_MAKE_MEM_DEFINED(chunk, ALLOCCHUNK_PRIVATE_LEN);
-
-	AllocFreeInfo(set, chunk);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 	/* Test for someone scribbling on unused space in chunk */
@@ -1052,7 +1032,7 @@ AllocSetFree(MemoryContext context, void *pointer)
 		if (block->next)
 			block->next->prev = block->prev;
 
-		context->mem_allocated -= block->endptr - ((char*) block);
+		context->mem_allocated -= block->endptr - ((char *) block);
 
 #ifdef CLOBBER_FREED_MEMORY
 		wipe_mem(block, block->freeptr - ((char *) block));
@@ -1144,7 +1124,7 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 
 		/* Do the realloc */
 		blksize = chksize + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
-		oldblksize = block->endptr - ((char *)block);
+		oldblksize = block->endptr - ((char *) block);
 
 		block = (AllocBlock) realloc(block, blksize);
 		if (block == NULL)

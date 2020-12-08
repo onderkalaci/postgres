@@ -24,7 +24,7 @@
  * with collations that match the remote table's columns, which we can
  * consider to be user error.
  *
- * Portions Copyright (c) 2012-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2020, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/deparse.c
@@ -389,6 +389,22 @@ foreign_expr_walker(Node *node,
 		case T_Param:
 			{
 				Param	   *p = (Param *) node;
+
+				/*
+				 * If it's a MULTIEXPR Param, punt.  We can't tell from here
+				 * whether the referenced sublink/subplan contains any remote
+				 * Vars; if it does, handling that is too complicated to
+				 * consider supporting at present.  Fortunately, MULTIEXPR
+				 * Params are not reduced to plain PARAM_EXEC until the end of
+				 * planning, so we can easily detect this case.  (Normal
+				 * PARAM_EXEC Params are safe to ship because their values
+				 * come from somewhere else in the plan tree; but a MULTIEXPR
+				 * references a sub-select elsewhere in the same targetlist,
+				 * so we'd be on the hook to evaluate it somehow if we wanted
+				 * to handle such cases as direct foreign updates.)
+				 */
+				if (p->paramkind == PARAM_MULTIEXPR)
+					return false;
 
 				/*
 				 * Collation rule is same as for Consts and non-foreign Vars.
@@ -2690,7 +2706,6 @@ deparseOpExpr(OpExpr *node, deparse_expr_cxt *context)
 	HeapTuple	tuple;
 	Form_pg_operator form;
 	char		oprkind;
-	ListCell   *arg;
 
 	/* Retrieve information about the operator from system catalog. */
 	tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
@@ -2700,18 +2715,16 @@ deparseOpExpr(OpExpr *node, deparse_expr_cxt *context)
 	oprkind = form->oprkind;
 
 	/* Sanity check. */
-	Assert((oprkind == 'r' && list_length(node->args) == 1) ||
-		   (oprkind == 'l' && list_length(node->args) == 1) ||
+	Assert((oprkind == 'l' && list_length(node->args) == 1) ||
 		   (oprkind == 'b' && list_length(node->args) == 2));
 
 	/* Always parenthesize the expression. */
 	appendStringInfoChar(buf, '(');
 
-	/* Deparse left operand. */
-	if (oprkind == 'r' || oprkind == 'b')
+	/* Deparse left operand, if any. */
+	if (oprkind == 'b')
 	{
-		arg = list_head(node->args);
-		deparseExpr(lfirst(arg), context);
+		deparseExpr(linitial(node->args), context);
 		appendStringInfoChar(buf, ' ');
 	}
 
@@ -2719,12 +2732,8 @@ deparseOpExpr(OpExpr *node, deparse_expr_cxt *context)
 	deparseOperatorName(buf, form);
 
 	/* Deparse right operand. */
-	if (oprkind == 'l' || oprkind == 'b')
-	{
-		arg = list_tail(node->args);
-		appendStringInfoChar(buf, ' ');
-		deparseExpr(lfirst(arg), context);
-	}
+	appendStringInfoChar(buf, ' ');
+	deparseExpr(llast(node->args), context);
 
 	appendStringInfoChar(buf, ')');
 

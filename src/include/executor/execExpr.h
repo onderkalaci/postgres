@@ -4,7 +4,7 @@
  *	  Low level infrastructure related to expression evaluation
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/execExpr.h
@@ -218,17 +218,19 @@ typedef enum ExprEvalOp
 	EEOP_GROUPING_FUNC,
 	EEOP_WINDOW_FUNC,
 	EEOP_SUBPLAN,
-	EEOP_ALTERNATIVE_SUBPLAN,
 
 	/* aggregation related nodes */
 	EEOP_AGG_STRICT_DESERIALIZE,
 	EEOP_AGG_DESERIALIZE,
 	EEOP_AGG_STRICT_INPUT_CHECK_ARGS,
 	EEOP_AGG_STRICT_INPUT_CHECK_NULLS,
-	EEOP_AGG_INIT_TRANS,
-	EEOP_AGG_STRICT_TRANS_CHECK,
+	EEOP_AGG_PLAIN_PERGROUP_NULLCHECK,
+	EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL,
+	EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL,
 	EEOP_AGG_PLAIN_TRANS_BYVAL,
-	EEOP_AGG_PLAIN_TRANS,
+	EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF,
+	EEOP_AGG_PLAIN_TRANS_STRICT_BYREF,
+	EEOP_AGG_PLAIN_TRANS_BYREF,
 	EEOP_AGG_ORDERED_TRANS_DATUM,
 	EEOP_AGG_ORDERED_TRANS_TUPLE,
 
@@ -562,14 +564,12 @@ typedef struct ExprEvalStep
 		/* for EEOP_AGGREF */
 		struct
 		{
-			/* out-of-line state, modified by nodeAgg.c */
-			AggrefExprState *astate;
+			int			aggno;
 		}			aggref;
 
 		/* for EEOP_GROUPING_FUNC */
 		struct
 		{
-			AggState   *parent; /* parent Agg */
 			List	   *clauses;	/* integer list of column numbers */
 		}			grouping_func;
 
@@ -587,17 +587,9 @@ typedef struct ExprEvalStep
 			SubPlanState *sstate;
 		}			subplan;
 
-		/* for EEOP_ALTERNATIVE_SUBPLAN */
-		struct
-		{
-			/* out-of-line state, created by nodeSubplan.c */
-			AlternativeSubPlanState *asstate;
-		}			alternative_subplan;
-
 		/* for EEOP_AGG_*DESERIALIZE */
 		struct
 		{
-			AggState   *aggstate;
 			FunctionCallInfo fcinfo_data;
 			int			jumpnull;
 		}			agg_deserialize;
@@ -622,32 +614,17 @@ typedef struct ExprEvalStep
 			int			jumpnull;
 		}			agg_strict_input_check;
 
-		/* for EEOP_AGG_INIT_TRANS */
+		/* for EEOP_AGG_PLAIN_PERGROUP_NULLCHECK */
 		struct
 		{
-			AggState   *aggstate;
-			AggStatePerTrans pertrans;
-			ExprContext *aggcontext;
-			int			setno;
-			int			transno;
 			int			setoff;
 			int			jumpnull;
-		}			agg_init_trans;
+		}			agg_plain_pergroup_nullcheck;
 
-		/* for EEOP_AGG_STRICT_TRANS_CHECK */
+		/* for EEOP_AGG_PLAIN_TRANS_[INIT_][STRICT_]{BYVAL,BYREF} */
+		/* for EEOP_AGG_ORDERED_TRANS_{DATUM,TUPLE} */
 		struct
 		{
-			AggState   *aggstate;
-			int			setno;
-			int			transno;
-			int			setoff;
-			int			jumpnull;
-		}			agg_strict_trans_check;
-
-		/* for EEOP_AGG_{PLAIN,ORDERED}_TRANS* */
-		struct
-		{
-			AggState   *aggstate;
 			AggStatePerTrans pertrans;
 			ExprContext *aggcontext;
 			int			setno;
@@ -748,14 +725,13 @@ extern void ExecEvalXmlExpr(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalGroupingFunc(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalSubPlan(ExprState *state, ExprEvalStep *op,
 							ExprContext *econtext);
-extern void ExecEvalAlternativeSubPlan(ExprState *state, ExprEvalStep *op,
-									   ExprContext *econtext);
 extern void ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op,
 								ExprContext *econtext);
 extern void ExecEvalSysVar(ExprState *state, ExprEvalStep *op,
 						   ExprContext *econtext, TupleTableSlot *slot);
 
-extern void ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroup);
+extern void ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroup,
+							 ExprContext *aggcontext);
 extern Datum ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
 								  Datum newValue, bool newValueIsNull,
 								  Datum oldValue, bool oldValueIsNull);

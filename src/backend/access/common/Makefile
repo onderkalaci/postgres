@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	attmap.o \
 	bufmask.o \
 	detoast.o \
 	heaptuple.o \
@@ -23,6 +24,7 @@ OBJS = \
 	reloptions.o \
 	scankey.o \
 	session.o \
+	syncscan.o \
 	toast_internals.o \
 	tupconvert.o \
 	tupdesc.o

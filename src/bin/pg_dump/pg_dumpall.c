@@ -2,7 +2,7 @@
  *
  * pg_dumpall.c
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * pg_dumpall forces all pg_dump output to be text, since it also outputs
@@ -18,10 +18,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "common/connect.h"
 #include "common/file_utils.h"
 #include "common/logging.h"
+#include "common/string.h"
 #include "dumputils.h"
-#include "fe_utils/connect.h"
 #include "fe_utils/string_utils.h"
 #include "getopt_long.h"
 #include "pg_backup.h"
@@ -196,15 +197,15 @@ main(int argc, char *argv[])
 			strlcpy(full_path, progname, sizeof(full_path));
 
 		if (ret == -1)
-			pg_log_error("The program \"pg_dump\" is needed by %s but was not found in the\n"
+			pg_log_error("The program \"%s\" is needed by %s but was not found in the\n"
 						 "same directory as \"%s\".\n"
 						 "Check your installation.",
-						 progname, full_path);
+						 "pg_dump", progname, full_path);
 		else
-			pg_log_error("The program \"pg_dump\" was found by \"%s\"\n"
+			pg_log_error("The program \"%s\" was found by \"%s\"\n"
 						 "but was not the same version as %s.\n"
 						 "Check your installation.",
-						 full_path, progname);
+						 "pg_dump", full_path, progname);
 		exit_nicely(1);
 	}
 
@@ -282,7 +283,7 @@ main(int argc, char *argv[])
 
 			case 'v':
 				verbose = true;
-				pg_logging_set_level(PG_LOG_INFO);
+				pg_logging_increase_verbosity();
 				appendPQExpBufferStr(pgdumpopts, " -v");
 				break;
 
@@ -670,7 +671,8 @@ help(void)
 
 	printf(_("\nIf -f/--file is not used, then the SQL script will be written to the standard\n"
 			 "output.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
+	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
 
@@ -1612,7 +1614,7 @@ buildShSecLabels(PGconn *conn, const char *catalog_name, Oid objectId,
 	PQExpBuffer sql = createPQExpBuffer();
 	PGresult   *res;
 
-	buildShSecLabelQuery(conn, catalog_name, objectId, sql);
+	buildShSecLabelQuery(catalog_name, objectId, sql);
 	res = executeQuery(conn, sql->data);
 	emitShSecLabels(conn, res, buffer, objtype, objname);
 
@@ -1642,14 +1644,10 @@ connectDatabase(const char *dbname, const char *connection_string,
 	const char **keywords = NULL;
 	const char **values = NULL;
 	PQconninfoOption *conn_opts = NULL;
-	static bool have_password = false;
-	static char password[100];
+	static char *password = NULL;
 
-	if (prompt_password == TRI_YES && !have_password)
-	{
-		simple_prompt("Password: ", password, sizeof(password), false);
-		have_password = true;
-	}
+	if (prompt_password == TRI_YES && !password)
+		password = simple_prompt("Password: ", false);
 
 	/*
 	 * Start the connection.  Loop until we have a password if requested by
@@ -1729,7 +1727,7 @@ connectDatabase(const char *dbname, const char *connection_string,
 			values[i] = pguser;
 			i++;
 		}
-		if (have_password)
+		if (password)
 		{
 			keywords[i] = "password";
 			values[i] = password;
@@ -1756,12 +1754,11 @@ connectDatabase(const char *dbname, const char *connection_string,
 
 		if (PQstatus(conn) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(conn) &&
-			!have_password &&
+			!password &&
 			prompt_password != TRI_NO)
 		{
 			PQfinish(conn);
-			simple_prompt("Password: ", password, sizeof(password), false);
-			have_password = true;
+			password = simple_prompt("Password: ", false);
 			new_pass = true;
 		}
 	} while (new_pass);

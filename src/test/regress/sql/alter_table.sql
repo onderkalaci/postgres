@@ -757,6 +757,28 @@ alter table atacc1
   add primary key(a);
 drop table atacc1;
 
+-- additionally, we've seen issues with foreign key validation not being
+-- properly delayed until after a table rewrite.  Check that works ok.
+create table atacc1 (a int primary key);
+alter table atacc1 add constraint atacc1_fkey foreign key (a) references atacc1 (a) not valid;
+alter table atacc1 validate constraint atacc1_fkey, alter a type bigint;
+drop table atacc1;
+
+-- we've also seen issues with check constraints being validated at the wrong
+-- time when there's a pending table rewrite.
+create table atacc1 (a bigint, b int);
+insert into atacc1 values(1,1);
+alter table atacc1 add constraint atacc1_chk check(b = 1) not valid;
+alter table atacc1 validate constraint atacc1_chk, alter a type int;
+drop table atacc1;
+
+-- same as above, but ensure the constraint violation is detected
+create table atacc1 (a bigint, b int);
+insert into atacc1 values(1,2);
+alter table atacc1 add constraint atacc1_chk check(b = 1) not valid;
+alter table atacc1 validate constraint atacc1_chk, alter a type int;
+drop table atacc1;
+
 -- something a little more complicated
 create table atacc1 ( test int, test2 int);
 -- add a primary key constraint
@@ -1342,21 +1364,30 @@ alter table anothertab alter column f5 type bigint;
 
 drop table anothertab;
 
-create table another (f1 int, f2 text);
+-- test that USING expressions are parsed before column alter type / drop steps
+create table another (f1 int, f2 text, f3 text);
 
-insert into another values(1, 'one');
-insert into another values(2, 'two');
-insert into another values(3, 'three');
+insert into another values(1, 'one', 'uno');
+insert into another values(2, 'two', 'due');
+insert into another values(3, 'three', 'tre');
 
 select * from another;
 
 alter table another
-  alter f1 type text using f2 || ' more',
-  alter f2 type bigint using f1 * 10;
+  alter f1 type text using f2 || ' and ' || f3 || ' more',
+  alter f2 type bigint using f1 * 10,
+  drop column f3;
 
 select * from another;
 
 drop table another;
+
+-- Create an index that skips WAL, then perform a SET DATA TYPE that skips
+-- rewriting the index.
+begin;
+create table skip_wal_skip_rewrite_index (c varchar(10) primary key);
+alter table skip_wal_skip_rewrite_index alter c type varchar(20);
+commit;
 
 -- table's row type
 create table tab1 (a int, b text);
@@ -1462,6 +1493,12 @@ alter table test_storage alter a set storage extended; -- re-add TOAST table
 select reltoastrelid <> 0 as has_toast_table
 from pg_class
 where oid = 'test_storage'::regclass;
+
+-- test that SET STORAGE propagates to index correctly
+create index test_storage_idx on test_storage (b, a);
+alter table test_storage alter column a set storage external;
+\d+ test_storage
+\d+ test_storage_idx
 
 -- ALTER COLUMN TYPE with a check constraint and a child table (bug #13779)
 CREATE TABLE test_inh_check (a float check (a > 10.2), b float);
@@ -1636,7 +1673,7 @@ from pg_locks l join pg_class c on l.relation = c.oid
 where virtualtransaction = (
         select virtualtransaction
         from pg_locks
-        where transactionid = txid_current()::integer)
+        where transactionid = pg_current_xact_id()::xid)
 and locktype = 'relation'
 and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
 and c.relname != 'my_locks'
@@ -1723,7 +1760,7 @@ from pg_locks l join pg_class c on l.relation = c.oid
 where virtualtransaction = (
         select virtualtransaction
         from pg_locks
-        where transactionid = txid_current()::integer)
+        where transactionid = pg_current_xact_id()::xid)
 and locktype = 'relation'
 and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
 and c.relname = 'my_locks'
@@ -2079,10 +2116,6 @@ WHERE c.oid IS NOT NULL OR m.mapped_oid IS NOT NULL;
 
 -- Checks on creating and manipulation of user defined relations in
 -- pg_catalog.
---
--- XXX: It would be useful to add checks around trying to manipulate
--- catalog tables, but that might have ugly consequences when run
--- against an existing server with allow_system_table_mods = on.
 
 SHOW allow_system_table_mods;
 -- disallowed because of search_path issues with pg_dump
@@ -2174,22 +2207,64 @@ ALTER TABLE ONLY test_add_column
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN c2 integer, -- fail because c2 already exists
-	ADD COLUMN c3 integer;
+	ADD COLUMN c3 integer primary key;
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
-	ADD COLUMN c3 integer; -- fail because c3 already exists
+	ADD COLUMN c3 integer primary key;
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
-	ADD COLUMN IF NOT EXISTS c3 integer; -- skipping because c3 already exists
+	ADD COLUMN IF NOT EXISTS c3 integer primary key; -- skipping because c3 already exists
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
 	ADD COLUMN IF NOT EXISTS c3 integer, -- skipping because c3 already exists
-	ADD COLUMN c4 integer;
+	ADD COLUMN c4 integer REFERENCES test_add_column;
 \d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c4 integer REFERENCES test_add_column;
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 8);
+\d test_add_column
+ALTER TABLE test_add_column
+	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 10);
+\d test_add_column*
 DROP TABLE test_add_column;
+\d test_add_column*
+
+-- assorted cases with multiple ALTER TABLE steps
+CREATE TABLE ataddindex(f1 INT);
+INSERT INTO ataddindex VALUES (42), (43);
+CREATE UNIQUE INDEX ataddindexi0 ON ataddindex(f1);
+ALTER TABLE ataddindex
+  ADD PRIMARY KEY USING INDEX ataddindexi0,
+  ALTER f1 TYPE BIGINT;
+\d ataddindex
+DROP TABLE ataddindex;
+
+CREATE TABLE ataddindex(f1 VARCHAR(10));
+INSERT INTO ataddindex(f1) VALUES ('foo'), ('a');
+ALTER TABLE ataddindex
+  ALTER f1 SET DATA TYPE TEXT,
+  ADD EXCLUDE ((f1 LIKE 'a') WITH =);
+\d ataddindex
+DROP TABLE ataddindex;
+
+CREATE TABLE ataddindex(id int, ref_id int);
+ALTER TABLE ataddindex
+  ADD PRIMARY KEY (id),
+  ADD FOREIGN KEY (ref_id) REFERENCES ataddindex;
+\d ataddindex
+DROP TABLE ataddindex;
+
+CREATE TABLE ataddindex(id int, ref_id int);
+ALTER TABLE ataddindex
+  ADD UNIQUE (id),
+  ADD FOREIGN KEY (ref_id) REFERENCES ataddindex (id);
+\d ataddindex
+DROP TABLE ataddindex;
 
 -- unsupported constraint types for partitioned tables
 CREATE TABLE partitioned (
@@ -2519,7 +2594,7 @@ DROP TABLE quuux;
 -- check validation when attaching hash partitions
 
 -- Use hand-rolled hash functions and operator class to get predictable result
--- on different matchines. part_test_int4_ops is defined in insert.sql.
+-- on different machines. part_test_int4_ops is defined in insert.sql.
 
 -- check that the new partition won't overlap with an existing partition
 CREATE TABLE hash_parted (
@@ -2775,3 +2850,67 @@ alter table at_test_sql_partop attach partition at_test_sql_partop_1 for values 
 drop table at_test_sql_partop;
 drop operator class at_test_sql_partop using btree;
 drop function at_test_sql_partop;
+
+
+/* Test case for bug #16242 */
+
+-- We create a parent and child where the child has missing
+-- non-null attribute values, and arrange to pass them through
+-- tuple conversion from the child to the parent tupdesc
+create table bar1 (a integer, b integer not null default 1)
+  partition by range (a);
+create table bar2 (a integer);
+insert into bar2 values (1);
+alter table bar2 add column b integer not null default 1;
+-- (at this point bar2 contains tuple with natts=1)
+alter table bar1 attach partition bar2 default;
+
+-- this works:
+select * from bar1;
+
+-- this exercises tuple conversion:
+create function xtrig()
+  returns trigger language plpgsql
+as $$
+  declare
+    r record;
+  begin
+    for r in select * from old loop
+      raise info 'a=%, b=%', r.a, r.b;
+    end loop;
+    return NULL;
+  end;
+$$;
+create trigger xtrig
+  after update on bar1
+  referencing old table as old
+  for each statement execute procedure xtrig();
+
+update bar1 set a = a + 1;
+
+/* End test case for bug #16242 */
+
+-- Test that ALTER TABLE rewrite preserves a clustered index
+-- for normal indexes and indexes on constraints.
+create table alttype_cluster (a int);
+alter table alttype_cluster add primary key (a);
+create index alttype_cluster_ind on alttype_cluster (a);
+alter table alttype_cluster cluster on alttype_cluster_ind;
+-- Normal index remains clustered.
+select indexrelid::regclass, indisclustered from pg_index
+  where indrelid = 'alttype_cluster'::regclass
+  order by indexrelid::regclass::text;
+alter table alttype_cluster alter a type bigint;
+select indexrelid::regclass, indisclustered from pg_index
+  where indrelid = 'alttype_cluster'::regclass
+  order by indexrelid::regclass::text;
+-- Constraint index remains clustered.
+alter table alttype_cluster cluster on alttype_cluster_pkey;
+select indexrelid::regclass, indisclustered from pg_index
+  where indrelid = 'alttype_cluster'::regclass
+  order by indexrelid::regclass::text;
+alter table alttype_cluster alter a type int;
+select indexrelid::regclass, indisclustered from pg_index
+  where indrelid = 'alttype_cluster'::regclass
+  order by indexrelid::regclass::text;
+drop table alttype_cluster;

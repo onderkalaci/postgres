@@ -5,7 +5,7 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,14 +26,12 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "catalog/catalog.h"
-#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_namespace.h"
-#include "catalog/pg_pltemplate.h"
 #include "catalog/pg_replication_origin.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
@@ -41,7 +39,6 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
-#include "catalog/toasting.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/fmgroids.h"
@@ -242,7 +239,6 @@ IsSharedRelation(Oid relationId)
 	if (relationId == AuthIdRelationId ||
 		relationId == AuthMemRelationId ||
 		relationId == DatabaseRelationId ||
-		relationId == PLTemplateRelationId ||
 		relationId == SharedDescriptionRelationId ||
 		relationId == SharedDependRelationId ||
 		relationId == SharedSecLabelRelationId ||
@@ -251,14 +247,13 @@ IsSharedRelation(Oid relationId)
 		relationId == ReplicationOriginRelationId ||
 		relationId == SubscriptionRelationId)
 		return true;
-	/* These are their indexes (see indexing.h) */
+	/* These are their indexes */
 	if (relationId == AuthIdRolnameIndexId ||
 		relationId == AuthIdOidIndexId ||
 		relationId == AuthMemRoleMemIndexId ||
 		relationId == AuthMemMemRoleIndexId ||
 		relationId == DatabaseNameIndexId ||
 		relationId == DatabaseOidIndexId ||
-		relationId == PLTemplateNameIndexId ||
 		relationId == SharedDescriptionObjIndexId ||
 		relationId == SharedDependDependerIndexId ||
 		relationId == SharedDependReferenceIndexId ||
@@ -271,15 +266,13 @@ IsSharedRelation(Oid relationId)
 		relationId == SubscriptionObjectIndexId ||
 		relationId == SubscriptionNameIndexId)
 		return true;
-	/* These are their toast tables and toast indexes (see toasting.h) */
+	/* These are their toast tables and toast indexes */
 	if (relationId == PgAuthidToastTable ||
 		relationId == PgAuthidToastIndex ||
 		relationId == PgDatabaseToastTable ||
 		relationId == PgDatabaseToastIndex ||
 		relationId == PgDbRoleSettingToastTable ||
 		relationId == PgDbRoleSettingToastIndex ||
-		relationId == PgPlTemplateToastTable ||
-		relationId == PgPlTemplateToastIndex ||
 		relationId == PgReplicationOriginToastTable ||
 		relationId == PgReplicationOriginToastIndex ||
 		relationId == PgShdescriptionToastTable ||

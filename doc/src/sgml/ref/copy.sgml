@@ -3,7 +3,6 @@ doc/src/sgml/ref/copy.sgml
 PostgreSQL documentation
 -->
 
-
 <refentry id="sql-copy">
  <indexterm zone="sql-copy">
   <primary>COPY</primary>
@@ -61,11 +60,11 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
   </para>
 
   <para>
-   If a list of columns is specified, <command>COPY</command> will
-   only copy the data in the specified columns to or from the file.
-   If there are any columns in the table that are not in the column list,
-   <command>COPY FROM</command> will insert the default values for
-   those columns.
+   If a column list is specified, <command>COPY TO</command> copies only
+   the data in the specified columns to the file.  For <command>COPY
+   FROM</command>, each field in the file is inserted, in order, into the
+   specified column.  Table columns not specified in the <command>COPY
+   FROM</command> column list will receive their default values.
   </para>
 
   <para>
@@ -113,9 +112,11 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
     <term><replaceable class="parameter">query</replaceable></term>
     <listitem>
      <para>
-      A <xref linkend="sql-select"/>, <xref linkend="sql-values"/>,
-      <xref linkend="sql-insert"/>, <xref linkend="sql-update"/> or
-      <xref linkend="sql-delete"/> command whose results are to be
+      A <link linkend="sql-select"><command>SELECT</command></link>,
+      <link linkend="sql-values"><command>VALUES</command></link>,
+      <link linkend="sql-insert"><command>INSERT</command></link>,
+      <link linkend="sql-update"><command>UPDATE</command></link>, or
+      <link linkend="sql-delete"><command>DELETE</command></link> command whose results are to be
       copied.  Note that parentheses are required around the query.
      </para>
      <para>

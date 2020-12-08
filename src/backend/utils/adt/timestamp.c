@@ -3,7 +3,7 @@
  * timestamp.c
  *	  Functions for the built-in SQL types "timestamp" and "interval".
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,6 +32,7 @@
 #include "parser/scansup.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/float.h"
 
@@ -555,17 +556,21 @@ make_timestamp_internal(int year, int month, int day,
 	TimeOffset	date;
 	TimeOffset	time;
 	int			dterr;
+	bool		bc = false;
 	Timestamp	result;
 
 	tm.tm_year = year;
 	tm.tm_mon = month;
 	tm.tm_mday = day;
 
-	/*
-	 * Note: we'll reject zero or negative year values.  Perhaps negatives
-	 * should be allowed to represent BC years?
-	 */
-	dterr = ValidateDate(DTK_DATE_M, false, false, false, &tm);
+	/* Handle negative years as BC */
+	if (tm.tm_year < 0)
+	{
+		bc = true;
+		tm.tm_year = -tm.tm_year;
+	}
+
+	dterr = ValidateDate(DTK_DATE_M, false, false, bc, &tm);
 
 	if (dterr != 0)
 		ereport(ERROR,
@@ -581,18 +586,8 @@ make_timestamp_internal(int year, int month, int day,
 
 	date = date2j(tm.tm_year, tm.tm_mon, tm.tm_mday) - POSTGRES_EPOCH_JDATE;
 
-	/*
-	 * This should match the checks in DecodeTimeOnly, except that since we're
-	 * dealing with a float "sec" value, we also explicitly reject NaN.  (An
-	 * infinity input should get rejected by the range comparisons, but we
-	 * can't be sure how those will treat a NaN.)
-	 */
-	if (hour < 0 || min < 0 || min > MINS_PER_HOUR - 1 ||
-		isnan(sec) ||
-		sec < 0 || sec > SECS_PER_MINUTE ||
-		hour > HOURS_PER_DAY ||
-	/* test for > 24:00:00 */
-		(hour == HOURS_PER_DAY && (min > 0 || sec > 0)))
+	/* Check for time overflow */
+	if (float_time_overflows(hour, min, sec))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
 				 errmsg("time field value out of range: %d:%02d:%02g",
@@ -600,7 +595,7 @@ make_timestamp_internal(int year, int month, int day,
 
 	/* This should match tm2time */
 	time = (((hour * MINS_PER_HOUR + min) * SECS_PER_MINUTE)
-			* USECS_PER_SEC) + rint(sec * USECS_PER_SEC);
+			* USECS_PER_SEC) + (int64) rint(sec * USECS_PER_SEC);
 
 	result = date * USECS_PER_DAY + time;
 	/* check for major overflow */
@@ -1263,7 +1258,7 @@ interval_support(PG_FUNCTION_ARGS)
 
 		typmod = (Node *) lsecond(expr->args);
 
-		if (IsA(typmod, Const) &&!((Const *) typmod)->constisnull)
+		if (IsA(typmod, Const) && !((Const *) typmod)->constisnull)
 		{
 			Node	   *source = (Node *) linitial(expr->args);
 			int32		new_typmod = DatumGetInt32(((Const *) typmod)->constvalue);
@@ -1646,12 +1641,14 @@ timeofday(PG_FUNCTION_ARGS)
  * TimestampDifference -- convert the difference between two timestamps
  *		into integer seconds and microseconds
  *
+ * This is typically used to calculate a wait timeout for select(2),
+ * which explains the otherwise-odd choice of output format.
+ *
  * Both inputs must be ordinary finite timestamps (in current usage,
  * they'll be results from GetCurrentTimestamp()).
  *
- * We expect start_time <= stop_time.  If not, we return zeros; for current
- * callers there is no need to be tense about which way division rounds on
- * negative inputs.
+ * We expect start_time <= stop_time.  If not, we return zeros,
+ * since then we're already past the previously determined stop_time.
  */
 void
 TimestampDifference(TimestampTz start_time, TimestampTz stop_time,
@@ -1669,6 +1666,36 @@ TimestampDifference(TimestampTz start_time, TimestampTz stop_time,
 		*secs = (long) (diff / USECS_PER_SEC);
 		*microsecs = (int) (diff % USECS_PER_SEC);
 	}
+}
+
+/*
+ * TimestampDifferenceMilliseconds -- convert the difference between two
+ * 		timestamps into integer milliseconds
+ *
+ * This is typically used to calculate a wait timeout for WaitLatch()
+ * or a related function.  The choice of "long" as the result type
+ * is to harmonize with that.  It is caller's responsibility that the
+ * input timestamps not be so far apart as to risk overflow of "long"
+ * (which'd happen at about 25 days on machines with 32-bit "long").
+ *
+ * Both inputs must be ordinary finite timestamps (in current usage,
+ * they'll be results from GetCurrentTimestamp()).
+ *
+ * We expect start_time <= stop_time.  If not, we return zero,
+ * since then we're already past the previously determined stop_time.
+ *
+ * Note we round up any fractional millisecond, since waiting for just
+ * less than the intended timeout is undesirable.
+ */
+long
+TimestampDifferenceMilliseconds(TimestampTz start_time, TimestampTz stop_time)
+{
+	TimestampTz diff = stop_time - start_time;
+
+	if (diff <= 0)
+		return 0;
+	else
+		return (long) ((diff + 999) / 1000);
 }
 
 /*
@@ -1738,6 +1765,8 @@ timestamptz_to_time_t(TimestampTz t)
  * This is mostly for use in emitting messages.  The primary difference
  * from timestamptz_out is that we force the output format to ISO.  Note
  * also that the result is in a static buffer, not pstrdup'd.
+ *
+ * See also pg_strftime.
  */
 const char *
 timestamptz_to_str(TimestampTz t)
@@ -2159,16 +2188,34 @@ timestamp_hash_extended(PG_FUNCTION_ARGS)
  * Cross-type comparison functions for timestamp vs timestamptz
  */
 
+int32
+timestamp_cmp_timestamptz_internal(Timestamp timestampVal, TimestampTz dt2)
+{
+	TimestampTz dt1;
+	int			overflow;
+
+	dt1 = timestamp2timestamptz_opt_overflow(timestampVal, &overflow);
+	if (overflow > 0)
+	{
+		/* dt1 is larger than any finite timestamp, but less than infinity */
+		return TIMESTAMP_IS_NOEND(dt2) ? -1 : +1;
+	}
+	if (overflow < 0)
+	{
+		/* dt1 is less than any finite timestamp, but more than -infinity */
+		return TIMESTAMP_IS_NOBEGIN(dt2) ? +1 : -1;
+	}
+
+	return timestamptz_cmp_internal(dt1, dt2);
+}
+
 Datum
 timestamp_eq_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) == 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt2) == 0);
 }
 
 Datum
@@ -2176,11 +2223,8 @@ timestamp_ne_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) != 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt2) != 0);
 }
 
 Datum
@@ -2188,11 +2232,8 @@ timestamp_lt_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) < 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt2) < 0);
 }
 
 Datum
@@ -2200,11 +2241,8 @@ timestamp_gt_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) > 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt2) > 0);
 }
 
 Datum
@@ -2212,11 +2250,8 @@ timestamp_le_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) <= 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt2) <= 0);
 }
 
 Datum
@@ -2224,11 +2259,8 @@ timestamp_ge_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) >= 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt2) >= 0);
 }
 
 Datum
@@ -2236,11 +2268,8 @@ timestamp_cmp_timestamptz(PG_FUNCTION_ARGS)
 {
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(0);
 	TimestampTz dt2 = PG_GETARG_TIMESTAMPTZ(1);
-	TimestampTz dt1;
 
-	dt1 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_INT32(timestamp_cmp_internal(dt1, dt2));
+	PG_RETURN_INT32(timestamp_cmp_timestamptz_internal(timestampVal, dt2));
 }
 
 Datum
@@ -2248,11 +2277,8 @@ timestamptz_eq_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) == 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt1) == 0);
 }
 
 Datum
@@ -2260,11 +2286,8 @@ timestamptz_ne_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) != 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt1) != 0);
 }
 
 Datum
@@ -2272,11 +2295,8 @@ timestamptz_lt_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) < 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt1) > 0);
 }
 
 Datum
@@ -2284,11 +2304,8 @@ timestamptz_gt_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) > 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt1) < 0);
 }
 
 Datum
@@ -2296,11 +2313,8 @@ timestamptz_le_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) <= 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt1) >= 0);
 }
 
 Datum
@@ -2308,11 +2322,8 @@ timestamptz_ge_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_BOOL(timestamp_cmp_internal(dt1, dt2) >= 0);
+	PG_RETURN_BOOL(timestamp_cmp_timestamptz_internal(timestampVal, dt1) <= 0);
 }
 
 Datum
@@ -2320,11 +2331,8 @@ timestamptz_cmp_timestamp(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt1 = PG_GETARG_TIMESTAMPTZ(0);
 	Timestamp	timestampVal = PG_GETARG_TIMESTAMP(1);
-	TimestampTz dt2;
 
-	dt2 = timestamp2timestamptz(timestampVal);
-
-	PG_RETURN_INT32(timestamp_cmp_internal(dt1, dt2));
+	PG_RETURN_INT32(-timestamp_cmp_timestamptz_internal(timestampVal, dt1));
 }
 
 
@@ -3421,7 +3429,7 @@ interval_accum(PG_FUNCTION_ARGS)
 	ArrayType  *result;
 
 	deconstruct_array(transarray,
-					  INTERVALOID, sizeof(Interval), false, 'd',
+					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
 					  &transdatums, NULL, &ndatums);
 	if (ndatums != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3438,7 +3446,7 @@ interval_accum(PG_FUNCTION_ARGS)
 	transdatums[1] = IntervalPGetDatum(&N);
 
 	result = construct_array(transdatums, 2,
-							 INTERVALOID, sizeof(Interval), false, 'd');
+							 INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE);
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
@@ -3461,7 +3469,7 @@ interval_combine(PG_FUNCTION_ARGS)
 	ArrayType  *result;
 
 	deconstruct_array(transarray1,
-					  INTERVALOID, sizeof(Interval), false, 'd',
+					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
 					  &transdatums1, NULL, &ndatums1);
 	if (ndatums1 != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3470,7 +3478,7 @@ interval_combine(PG_FUNCTION_ARGS)
 	N1 = *(DatumGetIntervalP(transdatums1[1]));
 
 	deconstruct_array(transarray2,
-					  INTERVALOID, sizeof(Interval), false, 'd',
+					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
 					  &transdatums2, NULL, &ndatums2);
 	if (ndatums2 != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3487,7 +3495,7 @@ interval_combine(PG_FUNCTION_ARGS)
 	transdatums1[1] = IntervalPGetDatum(&N1);
 
 	result = construct_array(transdatums1, 2,
-							 INTERVALOID, sizeof(Interval), false, 'd');
+							 INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE);
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
@@ -3505,7 +3513,7 @@ interval_accum_inv(PG_FUNCTION_ARGS)
 	ArrayType  *result;
 
 	deconstruct_array(transarray,
-					  INTERVALOID, sizeof(Interval), false, 'd',
+					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
 					  &transdatums, NULL, &ndatums);
 	if (ndatums != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3522,7 +3530,7 @@ interval_accum_inv(PG_FUNCTION_ARGS)
 	transdatums[1] = IntervalPGetDatum(&N);
 
 	result = construct_array(transdatums, 2,
-							 INTERVALOID, sizeof(Interval), false, 'd');
+							 INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE);
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
@@ -3537,7 +3545,7 @@ interval_avg(PG_FUNCTION_ARGS)
 				N;
 
 	deconstruct_array(transarray,
-					  INTERVALOID, sizeof(Interval), false, 'd',
+					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
 					  &transdatums, NULL, &ndatums);
 	if (ndatums != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -4373,6 +4381,7 @@ date2isoweek(int year, int mon, int mday)
 /* date2isoyear()
  *
  *	Returns ISO 8601 year number.
+ *	Note: zero or negative results follow the year-zero-exists convention.
  */
 int
 date2isoyear(int year, int mon, int mday)
@@ -4647,24 +4656,19 @@ timestamp_part(PG_FUNCTION_ARGS)
 
 			case DTK_ISOYEAR:
 				result = date2isoyear(tm->tm_year, tm->tm_mon, tm->tm_mday);
+				/* Adjust BC years */
+				if (result <= 0)
+					result -= 1;
 				break;
 
 			case DTK_DOW:
 			case DTK_ISODOW:
-				if (timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-							 errmsg("timestamp out of range")));
 				result = j2day(date2j(tm->tm_year, tm->tm_mon, tm->tm_mday));
 				if (val == DTK_ISODOW && result == 0)
 					result = 7;
 				break;
 
 			case DTK_DOY:
-				if (timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-							 errmsg("timestamp out of range")));
 				result = (date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)
 						  - date2j(tm->tm_year, 1, 1) + 1);
 				break;
@@ -4851,24 +4855,19 @@ timestamptz_part(PG_FUNCTION_ARGS)
 
 			case DTK_ISOYEAR:
 				result = date2isoyear(tm->tm_year, tm->tm_mon, tm->tm_mday);
+				/* Adjust BC years */
+				if (result <= 0)
+					result -= 1;
 				break;
 
 			case DTK_DOW:
 			case DTK_ISODOW:
-				if (timestamp2tm(timestamp, &tz, tm, &fsec, NULL, NULL) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-							 errmsg("timestamp out of range")));
 				result = j2day(date2j(tm->tm_year, tm->tm_mon, tm->tm_mday));
 				if (val == DTK_ISODOW && result == 0)
 					result = 7;
 				break;
 
 			case DTK_DOY:
-				if (timestamp2tm(timestamp, &tz, tm, &fsec, NULL, NULL) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-							 errmsg("timestamp out of range")));
 				result = (date2j(tm->tm_year, tm->tm_mon, tm->tm_mday)
 						  - date2j(tm->tm_year, 1, 1) + 1);
 				break;
@@ -5190,9 +5189,12 @@ timestamp_timestamptz(PG_FUNCTION_ARGS)
 /*
  * Convert timestamp to timestamp with time zone.
  *
- * On overflow error is thrown if 'overflow' is NULL.  Otherwise, '*overflow'
- * is set to -1 (+1) when result value exceed lower (upper) boundary and zero
- * returned.
+ * On successful conversion, *overflow is set to zero if it's not NULL.
+ *
+ * If the timestamp is finite but out of the valid range for timestamptz, then:
+ * if overflow is NULL, we throw an out-of-range error.
+ * if overflow is not NULL, we store +1 or -1 there to indicate the sign
+ * of the overflow, and return the appropriate timestamptz infinity.
  */
 TimestampTz
 timestamp2timestamptz_opt_overflow(Timestamp timestamp, int *overflow)
@@ -5203,10 +5205,14 @@ timestamp2timestamptz_opt_overflow(Timestamp timestamp, int *overflow)
 	fsec_t		fsec;
 	int			tz;
 
+	if (overflow)
+		*overflow = 0;
+
 	if (TIMESTAMP_NOT_FINITE(timestamp))
 		return timestamp;
 
-	if (!timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL))
+	/* We don't expect this to fail, but check it pro forma */
+	if (timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) == 0)
 	{
 		tz = DetermineTimeZoneOffset(tm, session_timezone);
 
@@ -5219,13 +5225,16 @@ timestamp2timestamptz_opt_overflow(Timestamp timestamp, int *overflow)
 		else if (overflow)
 		{
 			if (result < MIN_TIMESTAMP)
+			{
 				*overflow = -1;
+				TIMESTAMP_NOBEGIN(result);
+			}
 			else
 			{
-				Assert(result >= END_TIMESTAMP);
 				*overflow = 1;
+				TIMESTAMP_NOEND(result);
 			}
-			return (TimestampTz) 0;
+			return result;
 		}
 	}
 
@@ -5237,7 +5246,7 @@ timestamp2timestamptz_opt_overflow(Timestamp timestamp, int *overflow)
 }
 
 /*
- * Single-argument version of timestamp2timestamptz_opt_overflow().
+ * Promote timestamp to timestamptz, throwing error for overflow.
  */
 static TimestampTz
 timestamp2timestamptz(Timestamp timestamp)
@@ -5468,8 +5477,7 @@ generate_series_timestamp(PG_FUNCTION_ARGS)
 		timestamp_cmp_internal(result, fctx->finish) >= 0)
 	{
 		/* increment current in preparation for next iteration */
-		fctx->current = DatumGetTimestamp(
-										  DirectFunctionCall2(timestamp_pl_interval,
+		fctx->current = DatumGetTimestamp(DirectFunctionCall2(timestamp_pl_interval,
 															  TimestampGetDatum(fctx->current),
 															  PointerGetDatum(&fctx->step)));
 
@@ -5549,8 +5557,7 @@ generate_series_timestamptz(PG_FUNCTION_ARGS)
 		timestamp_cmp_internal(result, fctx->finish) >= 0)
 	{
 		/* increment current in preparation for next iteration */
-		fctx->current = DatumGetTimestampTz(
-											DirectFunctionCall2(timestamptz_pl_interval,
+		fctx->current = DatumGetTimestampTz(DirectFunctionCall2(timestamptz_pl_interval,
 																TimestampTzGetDatum(fctx->current),
 																PointerGetDatum(&fctx->step)));
 

@@ -3,7 +3,7 @@
  * acl.c
  *	  Basic access control list data structures manipulation routines.
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,6 +26,7 @@
 #include "commands/dbcommands.h"
 #include "commands/proclang.h"
 #include "commands/tablespace.h"
+#include "common/hashfn.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
 #include "lib/qunique.h"
@@ -34,7 +35,6 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
-#include "utils/hashutils.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -246,9 +246,6 @@ aclparse(const char *s, AclItem *aip)
 
 	Assert(s && aip);
 
-#ifdef ACLDEBUG
-	elog(LOG, "aclparse: input = \"%s\"", s);
-#endif
 	s = getid(s, name);
 	if (*s != '=')
 	{
@@ -357,11 +354,6 @@ aclparse(const char *s, AclItem *aip)
 	}
 
 	ACLITEM_SET_PRIVS_GOPTIONS(*aip, privs, goption);
-
-#ifdef ACLDEBUG
-	elog(LOG, "aclparse: correctly read [%u %x %x]",
-		 aip->ai_grantee, privs, goption);
-#endif
 
 	return s;
 }
@@ -5225,6 +5217,7 @@ get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 			oid = get_role_oid(role->rolename, missing_ok);
 			break;
 
+		case ROLESPEC_CURRENT_ROLE:
 		case ROLESPEC_CURRENT_USER:
 			oid = GetUserId();
 			break;
@@ -5267,6 +5260,7 @@ get_rolespec_tuple(const RoleSpec *role)
 						 errmsg("role \"%s\" does not exist", role->rolename)));
 			break;
 
+		case ROLESPEC_CURRENT_ROLE:
 		case ROLESPEC_CURRENT_USER:
 			tuple = SearchSysCache1(AUTHOID, GetUserId());
 			if (!HeapTupleIsValid(tuple))

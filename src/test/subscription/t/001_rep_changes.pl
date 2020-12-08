@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use PostgresNode;
 use TestLib;
-use Test::More tests => 22;
+use Test::More tests => 23;
 
 # Initialize publisher node
 my $node_publisher = get_new_node('publisher');
@@ -16,6 +16,10 @@ $node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
+$node_publisher->safe_psql(
+	'postgres',
+	"CREATE FUNCTION public.pg_get_replica_identity_index(int)
+	 RETURNS regclass LANGUAGE sql AS 'SELECT 1/0'");    # shall not call
 $node_publisher->safe_psql('postgres',
 	"CREATE TABLE tab_notrep AS SELECT generate_series(1,10) AS a");
 $node_publisher->safe_psql('postgres',
@@ -34,6 +38,14 @@ $node_publisher->safe_psql('postgres',
 $node_publisher->safe_psql('postgres',
 	"CREATE TABLE tab_include (a int, b text, CONSTRAINT covering PRIMARY KEY(a) INCLUDE(b))"
 );
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tab_full_pk (a int primary key, b text)");
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE tab_full_pk REPLICA IDENTITY FULL");
+# Let this table with REPLICA IDENTITY NOTHING, allowing only INSERT changes.
+$node_publisher->safe_psql('postgres', "CREATE TABLE tab_nothing (a int)");
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE tab_nothing REPLICA IDENTITY NOTHING");
 
 # Setup structure on subscriber
 $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_notrep (a int)");
@@ -42,6 +54,11 @@ $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_full (a int)");
 $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_full2 (x text)");
 $node_subscriber->safe_psql('postgres',
 	"CREATE TABLE tab_rep (a int primary key)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE tab_full_pk (a int primary key, b text)");
+$node_subscriber->safe_psql('postgres',
+	"ALTER TABLE tab_full_pk REPLICA IDENTITY FULL");
+$node_subscriber->safe_psql('postgres', "CREATE TABLE tab_nothing (a int)");
 
 # different column count and order than on publisher
 $node_subscriber->safe_psql('postgres',
@@ -59,7 +76,7 @@ $node_publisher->safe_psql('postgres', "CREATE PUBLICATION tap_pub");
 $node_publisher->safe_psql('postgres',
 	"CREATE PUBLICATION tap_pub_ins_only WITH (publish = insert)");
 $node_publisher->safe_psql('postgres',
-	"ALTER PUBLICATION tap_pub ADD TABLE tab_rep, tab_full, tab_full2, tab_mixed, tab_include"
+	"ALTER PUBLICATION tap_pub ADD TABLE tab_rep, tab_full, tab_full2, tab_mixed, tab_include, tab_nothing, tab_full_pk"
 );
 $node_publisher->safe_psql('postgres',
 	"ALTER PUBLICATION tap_pub_ins_only ADD TABLE tab_ins");
@@ -98,6 +115,12 @@ $node_publisher->safe_psql('postgres',
 	"INSERT INTO tab_mixed VALUES (2, 'bar', 2.2)");
 
 $node_publisher->safe_psql('postgres',
+	"INSERT INTO tab_full_pk VALUES (1, 'foo')");
+
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tab_nothing VALUES (generate_series(1,20))");
+
+$node_publisher->safe_psql('postgres',
 	"INSERT INTO tab_include SELECT generate_series(1,50)");
 $node_publisher->safe_psql('postgres',
 	"DELETE FROM tab_include WHERE a > 20");
@@ -116,6 +139,10 @@ is($result, qq(20|-20|-1), 'check replicated changes on subscriber');
 $result = $node_subscriber->safe_psql('postgres', "SELECT * FROM tab_mixed");
 is( $result, qq(local|1.1|foo|1
 local|2.2|bar|2), 'check replicated changes with different column order');
+
+$result =
+  $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_nothing");
+is($result, qq(20), 'check replicated changes with REPLICA IDENTITY NOTHING');
 
 $result = $node_subscriber->safe_psql('postgres',
 	"SELECT count(*), min(a), max(a) FROM tab_include");
@@ -147,6 +174,8 @@ $node_publisher->safe_psql('postgres',
 	"UPDATE tab_full2 SET x = 'bb' WHERE x = 'b'");
 $node_publisher->safe_psql('postgres',
 	"UPDATE tab_mixed SET b = 'baz' WHERE a = 1");
+$node_publisher->safe_psql('postgres',
+	"UPDATE tab_full_pk SET b = 'bar' WHERE a = 1");
 
 $node_publisher->wait_for_catchup('tap_sub');
 

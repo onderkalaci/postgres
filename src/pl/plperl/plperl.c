@@ -1631,11 +1631,8 @@ plperl_trigger_build_args(FunctionCallInfo fcinfo)
 	tdata = (TriggerData *) fcinfo->context;
 	tupdesc = tdata->tg_relation->rd_att;
 
-	relid = DatumGetCString(
-							DirectFunctionCall1(oidout,
-												ObjectIdGetDatum(tdata->tg_relation->rd_id)
-												)
-		);
+	relid = DatumGetCString(DirectFunctionCall1(oidout,
+												ObjectIdGetDatum(tdata->tg_relation->rd_id)));
 
 	hv_store_string(hv, "name", cstr2sv(tdata->tg_trigger->tgname));
 	hv_store_string(hv, "relid", cstr2sv(relid));
@@ -1740,7 +1737,7 @@ plperl_event_trigger_build_args(FunctionCallInfo fcinfo)
 	tdata = (EventTriggerData *) fcinfo->context;
 
 	hv_store_string(hv, "event", cstr2sv(tdata->event));
-	hv_store_string(hv, "tag", cstr2sv(tdata->tag));
+	hv_store_string(hv, "tag", cstr2sv(GetCommandTagName(tdata->tag)));
 
 	return newRV_noinc((SV *) hv);
 }
@@ -2003,11 +2000,9 @@ plperl_validator(PG_FUNCTION_ARGS)
 	/* except for TRIGGER, EVTTRIGGER, RECORD, or VOID */
 	if (functyptype == TYPTYPE_PSEUDO)
 	{
-		/* we assume OPAQUE with no arguments means a trigger */
-		if (proc->prorettype == TRIGGEROID ||
-			(proc->prorettype == OPAQUEOID && proc->pronargs == 0))
+		if (proc->prorettype == TRIGGEROID)
 			is_trigger = true;
-		else if (proc->prorettype == EVTTRIGGEROID)
+		else if (proc->prorettype == EVENT_TRIGGEROID)
 			is_event_trigger = true;
 		else if (proc->prorettype != RECORDOID &&
 				 proc->prorettype != VOIDOID)
@@ -2147,8 +2142,6 @@ plperl_create_sub(plperl_proc_desc *prodesc, const char *s, Oid fn_oid)
 						prodesc->proname)));
 
 	prodesc->reference = subref;
-
-	return;
 }
 
 
@@ -2388,8 +2381,6 @@ plperl_call_perl_event_trigger_func(plperl_proc_desc *desc,
 	PUTBACK;
 	FREETMPS;
 	LEAVE;
-
-	return;
 }
 
 static Datum
@@ -2847,7 +2838,7 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 					rettype == RECORDOID)
 					 /* okay */ ;
 				else if (rettype == TRIGGEROID ||
-						 rettype == EVTTRIGGEROID)
+						 rettype == EVENT_TRIGGEROID)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("trigger functions can only be called "

@@ -23,7 +23,7 @@
  * for example).
  *
  *
- * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_description.h
@@ -62,5 +62,10 @@ CATALOG(pg_description,2609,DescriptionRelationId)
  * ----------------
  */
 typedef FormData_pg_description * Form_pg_description;
+
+DECLARE_TOAST(pg_description, 2834, 2835);
+
+DECLARE_UNIQUE_INDEX(pg_description_o_c_o_index, 2675, on pg_description using btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops));
+#define DescriptionObjIndexId  2675
 
 #endif							/* PG_DESCRIPTION_H */

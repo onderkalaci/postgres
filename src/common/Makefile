@@ -31,7 +31,6 @@ include $(top_builddir)/src/Makefile.global
 # don't include subdirectory-path-dependent -I and -L switches
 STD_CPPFLAGS := $(filter-out -I$(top_srcdir)/src/include -I$(top_builddir)/src/include,$(CPPFLAGS))
 STD_LDFLAGS := $(filter-out -L$(top_builddir)/src/common -L$(top_builddir)/src/port,$(LDFLAGS))
-override CPPFLAGS += -DVAL_CONFIGURE="\"$(configure_args)\""
 override CPPFLAGS += -DVAL_CC="\"$(CC)\""
 override CPPFLAGS += -DVAL_CPPFLAGS="\"$(STD_CPPFLAGS)\""
 override CPPFLAGS += -DVAL_CFLAGS="\"$(CFLAGS)\""
@@ -47,18 +46,25 @@ LIBS += $(PTHREAD_LIBS)
 # If you add objects here, see also src/tools/msvc/Mkvcbuild.pm
 
 OBJS_COMMON = \
+	archive.o \
 	base64.o \
+	checksum_helper.o \
 	config_info.o \
 	controldata_utils.o \
 	d2s.o \
+	encnames.o \
 	exec.o \
 	f2s.o \
 	file_perm.o \
+	file_utils.o \
+	hashfn.o \
 	ip.o \
+	jsonapi.o \
 	keywords.o \
 	kwlookup.o \
 	link-canary.o \
 	md5.o \
+	pg_get_line.o \
 	pg_lzcompress.o \
 	pgfnames.o \
 	psprintf.o \
@@ -70,25 +76,35 @@ OBJS_COMMON = \
 	stringinfo.o \
 	unicode_norm.o \
 	username.o \
-	wait_error.o
+	wait_error.o \
+	wchar.o
 
 ifeq ($(with_openssl),yes)
-OBJS_COMMON += sha2_openssl.o
+OBJS_COMMON += \
+	protocol_openssl.o \
+	cryptohash_openssl.o
 else
-OBJS_COMMON += sha2.o
+OBJS_COMMON += \
+	cryptohash.o \
+	sha2.o
 endif
 
 # A few files are currently only built for frontend, not server
-# (Mkvcbuild.pm has a copy of this list, too)
-OBJS_FRONTEND = \
+# (Mkvcbuild.pm has a copy of this list, too).  logging.c is excluded
+# from OBJS_FRONTEND_SHLIB (shared library) as a matter of policy,
+# because it is not appropriate for general purpose libraries such
+# as libpq to report errors directly.
+OBJS_FRONTEND_SHLIB = \
 	$(OBJS_COMMON) \
 	fe_memutils.o \
-	file_utils.o \
-	logging.o \
-	restricted_token.o
+	restricted_token.o \
+	sprompt.o
+OBJS_FRONTEND = \
+	$(OBJS_FRONTEND_SHLIB) \
+	logging.o
 
 # foo.o, foo_shlib.o, and foo_srv.o are all built from foo.c
-OBJS_SHLIB = $(OBJS_FRONTEND:%.o=%_shlib.o)
+OBJS_SHLIB = $(OBJS_FRONTEND_SHLIB:%.o=%_shlib.o)
 OBJS_SRV = $(OBJS_COMMON:%.o=%_srv.o)
 
 # where to find gen_keywordlist.pl and subsidiary files
