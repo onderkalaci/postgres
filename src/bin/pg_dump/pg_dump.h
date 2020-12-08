@@ -616,6 +616,7 @@ typedef struct _PublicationRelInfo
 	DumpableObject dobj;
 	TableInfo  *pubtable;
 	char	   *pubname;
+	char	   *pubrelqual;
 } PublicationRelInfo;
 
 /*
