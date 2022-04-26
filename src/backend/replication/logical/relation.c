@@ -24,6 +24,10 @@
 #include "nodes/makefuncs.h"
 #include "replication/logicalrelation.h"
 #include "replication/worker_internal.h"
+#include "optimizer/optimizer.h"
+#include "tcop/tcopprot.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/inval.h"
 
 
@@ -382,15 +386,44 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		/* fallback to PK if no replica identity */
 		if (idkey == NULL)
 		{
+			/* we should not have any local index associated yet */
+			Assert (entry->localindexoid == InvalidOid);
+
 			idkey = RelationGetIndexAttrBitmap(entry->localrel,
 											   INDEX_ATTR_BITMAP_PRIMARY_KEY);
 
 			/*
 			 * If no replica identity index and no PK, the published table
-			 * must have replica identity FULL.
+			 * must have replica identity FULL. And, if replica identity FULL
+			 * we can still use an index.
 			 */
-			if (idkey == NULL && remoterel->replident != REPLICA_IDENTITY_FULL)
+			if (idkey == NULL && remoterel->replident == REPLICA_IDENTITY_FULL)
+			{
+				Query *index_query;
+				char *index_query_cstr;
+				entry->updatable = true;
+
+				/* we should not have any local index associated yet */
+				Assert (entry->localindexoid == InvalidOid);
+
+				/* generate the parametrized query once */
+				index_query =
+					logicalrep_rel_gen_index_query(index_query, &index_query_cstr);
+
+				/* copy the query to the cache */
+				if (index_query != NULL)
+				{
+					oldctx = MemoryContextSwitchTo(LogicalRepRelMapContext);
+
+					entry->localindexquery = copyObject(index_query);
+
+					MemoryContextSwitchTo(oldctx);
+				}
+
+			}
+			else if (idkey == NULL && remoterel->replident != REPLICA_IDENTITY_FULL)
 				entry->updatable = false;
+
 		}
 
 		i = -1;
@@ -425,6 +458,101 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 
 	return entry;
 }
+
+
+/*
+ * Generate a query string in the form of:
+ * 	SELECT NULL FROM table WHERE col_1 = $1 AND col_2 = $2 .... col_n = $n
+ *
+ * 	Also, set the column types (paramTypes) and number of
+ * 	columns (nonDroppedColumnCount) for the caller.
+ */
+static char *
+generate_query_string_with_all_columns(Relation localrel, Oid *paramTypes, int *paramCount)
+{
+	StringInfo query = makeStringInfo();
+	int attno = 0;
+	char *namescape = get_namespace_name(RelationGetNamespace(localrel));
+	char *qualifiedName =
+		quote_qualified_identifier(namescape, RelationGetRelationName(localrel));
+
+	*paramCount = 0;
+
+	appendStringInfo(query, "SELECT NULL FROM %s WHERE ", qualifiedName);
+
+	for (attno = 0; attno < RelationGetNumberOfAttributes(localrel); attno++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(localrel->rd_att, attno);
+		char	   *name;
+
+		if (attr->attisdropped)
+		{
+			continue;
+		}
+		else
+		{
+			paramTypes[*paramCount] = attr->atttypid;
+
+			(*paramCount)++;
+
+			if (*paramCount != 1)
+			{
+				appendStringInfo(query, " AND ");
+			}
+
+			name = NameStr(attr->attname);
+			appendStringInfo(query, "%s = $%d", name, *paramCount);
+		}
+	}
+
+	return query->data;
+}
+
+
+/*
+ * If replica identity is full, we could still try to pick a suitable
+ * index on the apply side to avoid full table scans.
+ *
+ * This function is not a generic function. It should only be used
+ * when replica identity is FULL, because the logic relies on columns
+ * to be available.
+ *
+ * The planner knows much better about which index to pick. So, we rely
+ * on planner by generating a query which contains all the columns.
+ *
+ * If no index exists or the planner does not pick any indexes,
+ * InvalidOid is returned.
+ */
+Query *
+logicalrep_rel_gen_index_query(Relation localrel, char **query_string)
+{
+	/* no indexes anyway, just skip */
+	if (localrel->rd_indexlist == NIL)
+		return NULL;
+
+	RawStmt *parsetree;
+	List *querytree_list;
+	Oid paramTypes[MaxHeapAttributeNumber];
+	int paramCount = 0;
+
+	*query_string =
+		generate_query_string_with_all_columns(localrel, paramTypes,
+											   &paramCount);
+
+	parsetree =
+		(RawStmt *) linitial(pg_parse_query(*query_string));
+
+	querytree_list =
+		pg_analyze_and_rewrite_fixedparams(parsetree,
+										   *query_string,
+										   paramTypes,
+										   paramCount,
+										   NULL);
+
+	return linitial(querytree_list);
+}
+
+
 
 /*
  * Close the previously opened logical relation.

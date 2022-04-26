@@ -339,6 +339,7 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot);
 static bool FindReplTupleInLocalRel(EState *estate, Relation localrel,
+									Query *local_index_query,
 									LogicalRepRelation *remoterel,
 									TupleTableSlot *remoteslot,
 									TupleTableSlot **localslot);
@@ -1588,7 +1589,7 @@ apply_handle_type(StringInfo s)
  *
  * If neither is defined, returns InvalidOid
  */
-static Oid
+Oid
 GetRelationIdentityOrPK(Relation rel)
 {
 	Oid			idxoid;
@@ -1882,6 +1883,7 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 	EState	   *estate = edata->estate;
 	LogicalRepRelMapEntry *relmapentry = edata->targetRel;
 	Relation	localrel = relinfo->ri_RelationDesc;
+	Query			*local_index_query = relmapentry->localindexquery;
 	EPQState	epqstate;
 	TupleTableSlot *localslot;
 	bool		found;
@@ -1890,7 +1892,7 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
 	ExecOpenIndices(relinfo, false);
 
-	found = FindReplTupleInLocalRel(estate, localrel,
+	found = FindReplTupleInLocalRel(estate, localrel, local_index_query,
 									&relmapentry->remoterel,
 									remoteslot, &localslot);
 	ExecClearTuple(remoteslot);
@@ -2020,6 +2022,8 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 {
 	EState	   *estate = edata->estate;
 	Relation	localrel = relinfo->ri_RelationDesc;
+	LogicalRepRelMapEntry *relmapentry = edata->targetRel;
+	Query         *localindexquery = relmapentry->localindexquery;
 	LogicalRepRelation *remoterel = &edata->targetRel->remoterel;
 	EPQState	epqstate;
 	TupleTableSlot *localslot;
@@ -2028,8 +2032,8 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
 	ExecOpenIndices(relinfo, false);
 
-	found = FindReplTupleInLocalRel(estate, localrel, remoterel,
-									remoteslot, &localslot);
+	found = FindReplTupleInLocalRel(estate, localrel, localindexquery,
+									remoterel, remoteslot, &localslot);
 
 	/* If found delete it. */
 	if (found)
@@ -2059,6 +2063,97 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 	EvalPlanQualEnd(&epqstate);
 }
 
+
+/*
+ * Recursively search for any indexid used in a Plan.
+ *
+ * If not found, return InvalidOid.
+ */
+static Oid
+fetch_used_index_oid(Plan *plan)
+{
+	Oid indexOid;
+	BitmapIndexScan *bitmap_sc;
+	IndexScan *index_sc;
+	IndexOnlyScan *index_only_sc;
+
+	if (plan == NULL)
+	{
+		return InvalidOid;
+	}
+
+	if (IsA(plan, BitmapIndexScan))
+	{
+		bitmap_sc = (BitmapIndexScan *) plan;
+		return bitmap_sc->indexid;
+	}
+	else if (IsA(plan, IndexScan))
+	{
+		index_sc = (IndexScan *) plan;
+		return index_sc->indexid;
+	}
+	else if (IsA(plan, IndexOnlyScan))
+	{
+		index_only_sc = (IndexOnlyScan *) plan;
+		return index_only_sc->indexid;
+	}
+
+	indexOid = fetch_used_index_oid((Plan *) plan->lefttree);
+	if (indexOid == InvalidOid)
+	{
+		indexOid = fetch_used_index_oid((Plan *) plan->righttree);
+	}
+
+	return indexOid;
+}
+
+
+static Oid
+FindReplIndex(Relation localrel, Query *local_index_query,
+			  TupleTableSlot *remoteslot)
+{
+	PlannedStmt *stmt;
+	int			attno;
+	int			non_dropped_attno;
+	Oid paramTypes[MaxHeapAttributeNumber];
+	ParamListInfo paramList;
+
+	non_dropped_attno = 0;
+	for (attno = 0; attno < RelationGetNumberOfAttributes(localrel); attno++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(localrel->rd_att, attno);
+
+		if (attr->attisdropped)
+			continue;
+		else
+		{
+			paramTypes[non_dropped_attno] = attr->atttypid;
+			non_dropped_attno++;
+		}
+	}
+
+
+	paramList = makeParamList(non_dropped_attno);
+
+	slot_getallattrs(remoteslot);
+
+	for (attno = 0; attno < non_dropped_attno; attno++)
+	{
+		ParamExternData *prm = &paramList->params[attno];
+		Form_pg_attribute att;
+
+		att = TupleDescAttr(remoteslot->tts_tupleDescriptor, attno);
+		prm->value = remoteslot->tts_values[attno];
+		prm->isnull = remoteslot->tts_isnull[attno];
+		prm->pflags = PARAM_FLAG_CONST;
+		prm->ptype = att->atttypid;
+	}
+
+	stmt = planner(copyObject(local_index_query), NULL, 0, paramList);
+
+	return fetch_used_index_oid(stmt->planTree);
+}
+
 /*
  * Try to find a tuple received from the publication side (in 'remoteslot') in
  * the corresponding local relation using either replica identity index,
@@ -2068,6 +2163,7 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
  */
 static bool
 FindReplTupleInLocalRel(EState *estate, Relation localrel,
+						Query *local_index_query,
 						LogicalRepRelation *remoterel,
 						TupleTableSlot *remoteslot,
 						TupleTableSlot **localslot)
@@ -2083,9 +2179,15 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 
 	*localslot = table_slot_create(localrel, &estate->es_tupleTable);
 
+	/*
+	 * If we can find a relation identity index or primary key,
+	 * use it. Otherwise, try using any other
+	 * index if possible.
+	 */
 	idxoid = GetRelationIdentityOrPK(localrel);
-	Assert(OidIsValid(idxoid) ||
-		   (remoterel->replident == REPLICA_IDENTITY_FULL));
+	if (!OidIsValid(idxoid) && local_index_query != NULL)
+		idxoid = FindReplIndex(localrel, local_index_query,
+									  remoteslot);
 
 	if (OidIsValid(idxoid))
 		found = RelationFindReplTupleByIndex(localrel, idxoid,
@@ -2184,12 +2286,14 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 				TupleTableSlot *localslot;
 				ResultRelInfo *partrelinfo_new;
 				bool		found;
+				Query         *localindexquery = relmapentry->localindexquery;
+
 
 				part_entry = logicalrep_partition_open(relmapentry, partrel,
 													   attrmap);
 
 				/* Get the matching local tuple from the partition. */
-				found = FindReplTupleInLocalRel(estate, partrel,
+				found = FindReplTupleInLocalRel(estate, partrel, localindexquery,
 												&part_entry->remoterel,
 												remoteslot_part, &localslot);
 				if (!found)

@@ -15,5 +15,6 @@
 extern void ApplyWorkerMain(Datum main_arg);
 
 extern bool IsLogicalWorker(void);
+extern Oid GetRelationIdentityOrPK(Relation rel);
 
 #endif							/* LOGICALWORKER_H */

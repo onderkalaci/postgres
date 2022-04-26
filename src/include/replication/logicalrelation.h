@@ -32,6 +32,13 @@ typedef struct LogicalRepRelMapEntry
 	AttrMap    *attrmap;		/* map of local attributes to remote ones */
 	bool		updatable;		/* Can apply updates/deletes? */
 
+	/*
+	 * The oid of the index that should be used. When there is a replica
+	 * identity index or primary key, obviously prefer that. If not, still
+	 * pick an existing index.
+	 */
+	Query 				*localindexquery;
+
 	/* Sync state. */
 	char		state;
 	XLogRecPtr	statelsn;
@@ -45,5 +52,6 @@ extern LogicalRepRelMapEntry *logicalrep_partition_open(LogicalRepRelMapEntry *r
 														Relation partrel, AttrMap *map);
 extern void logicalrep_rel_close(LogicalRepRelMapEntry *rel,
 								 LOCKMODE lockmode);
+extern Query *logicalrep_rel_gen_index_query(Relation localrel, char **query_string);
 
 #endif							/* LOGICALRELATION_H */

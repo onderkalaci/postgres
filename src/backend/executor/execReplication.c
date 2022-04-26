@@ -111,6 +111,66 @@ build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel,
 }
 
 /*
+ * Compare the tuples in the slots by checking if they have equal values.
+ */
+static bool
+tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
+			 TypeCacheEntry **eq)
+{
+	int			attrnum;
+
+	Assert(slot1->tts_tupleDescriptor->natts ==
+		   slot2->tts_tupleDescriptor->natts);
+
+	slot_getallattrs(slot1);
+	slot_getallattrs(slot2);
+
+	/* Check equality of the attributes. */
+	for (attrnum = 0; attrnum < slot1->tts_tupleDescriptor->natts; attrnum++)
+	{
+		Form_pg_attribute att;
+		TypeCacheEntry *typentry;
+
+		/*
+		 * If one value is NULL and other is not, then they are certainly not
+		 * equal
+		 */
+		if (slot1->tts_isnull[attrnum] != slot2->tts_isnull[attrnum])
+			return false;
+
+		/*
+		 * If both are NULL, they can be considered equal.
+		 */
+		if (slot1->tts_isnull[attrnum] || slot2->tts_isnull[attrnum])
+			continue;
+
+		att = TupleDescAttr(slot1->tts_tupleDescriptor, attrnum);
+
+		typentry = eq[attrnum];
+		if (typentry == NULL)
+		{
+			typentry = lookup_type_cache(att->atttypid,
+										 TYPECACHE_EQ_OPR_FINFO);
+			if (!OidIsValid(typentry->eq_opr_finfo.fn_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("could not identify an equality operator for type %s",
+								format_type_be(att->atttypid))));
+			eq[attrnum] = typentry;
+		}
+
+		if (!DatumGetBool(FunctionCall2Coll(&typentry->eq_opr_finfo,
+											att->attcollation,
+											slot1->tts_values[attrnum],
+											slot2->tts_values[attrnum])))
+			return false;
+	}
+
+	return true;
+}
+
+
+/*
  * Search the relation 'rel' for tuple using the index.
  *
  * If a matching tuple is found, lock it with lockmode, fill the slot with its
@@ -128,9 +188,12 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 	TransactionId xwait;
 	Relation	idxrel;
 	bool		found;
+	TypeCacheEntry **eq;
 
 	/* Open the index. */
 	idxrel = index_open(idxoid, RowExclusiveLock);
+
+	eq = palloc0(sizeof(*eq) * outslot->tts_tupleDescriptor->natts);
 
 	/* Start an index scan. */
 	InitDirtySnapshot(snap);
@@ -147,8 +210,15 @@ retry:
 	index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(idxrel), NULL, 0);
 
 	/* Try to find the tuple */
-	if (index_getnext_slot(scan, ForwardScanDirection, outslot))
+	while (index_getnext_slot(scan, ForwardScanDirection, outslot))
 	{
+		if (!tuples_equal(outslot, searchslot, eq))
+		{
+			/* we cannot skip tuples from an index if it is a unique index */
+			Assert (!GetRelationIdentityOrPK(idxoid));
+			continue;
+		}
+
 		found = true;
 		ExecMaterializeSlot(outslot);
 
@@ -164,6 +234,9 @@ retry:
 			XactLockTableWait(xwait, NULL, NULL, XLTW_None);
 			goto retry;
 		}
+
+		/* Found our tuple and it's not locked */
+		break;
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
@@ -222,64 +295,6 @@ retry:
 	return found;
 }
 
-/*
- * Compare the tuples in the slots by checking if they have equal values.
- */
-static bool
-tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
-			 TypeCacheEntry **eq)
-{
-	int			attrnum;
-
-	Assert(slot1->tts_tupleDescriptor->natts ==
-		   slot2->tts_tupleDescriptor->natts);
-
-	slot_getallattrs(slot1);
-	slot_getallattrs(slot2);
-
-	/* Check equality of the attributes. */
-	for (attrnum = 0; attrnum < slot1->tts_tupleDescriptor->natts; attrnum++)
-	{
-		Form_pg_attribute att;
-		TypeCacheEntry *typentry;
-
-		/*
-		 * If one value is NULL and other is not, then they are certainly not
-		 * equal
-		 */
-		if (slot1->tts_isnull[attrnum] != slot2->tts_isnull[attrnum])
-			return false;
-
-		/*
-		 * If both are NULL, they can be considered equal.
-		 */
-		if (slot1->tts_isnull[attrnum] || slot2->tts_isnull[attrnum])
-			continue;
-
-		att = TupleDescAttr(slot1->tts_tupleDescriptor, attrnum);
-
-		typentry = eq[attrnum];
-		if (typentry == NULL)
-		{
-			typentry = lookup_type_cache(att->atttypid,
-										 TYPECACHE_EQ_OPR_FINFO);
-			if (!OidIsValid(typentry->eq_opr_finfo.fn_oid))
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("could not identify an equality operator for type %s",
-								format_type_be(att->atttypid))));
-			eq[attrnum] = typentry;
-		}
-
-		if (!DatumGetBool(FunctionCall2Coll(&typentry->eq_opr_finfo,
-											att->attcollation,
-											slot1->tts_values[attrnum],
-											slot2->tts_values[attrnum])))
-			return false;
-	}
-
-	return true;
-}
 
 /*
  * Search the relation 'rel' for tuple using the sequential scan.
