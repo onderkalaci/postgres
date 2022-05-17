@@ -131,9 +131,14 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 	TransactionId xwait;
 	Relation	idxrel;
 	bool		found;
+	TypeCacheEntry **eq;
+	bool 		indisunique;
 
 	/* Open the index. */
 	idxrel = index_open(idxoid, RowExclusiveLock);
+	indisunique = idxrel->rd_index->indisunique;
+	if (!indisunique)
+		eq = palloc0(sizeof(*eq) * outslot->tts_tupleDescriptor->natts);
 
 	/* Start an index scan. */
 	InitDirtySnapshot(snap);
@@ -150,9 +155,16 @@ retry:
 	index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(idxrel), NULL, 0);
 
 	/* Try to find the tuple */
-	if (index_getnext_slot(scan, ForwardScanDirection, outslot))
+	while (index_getnext_slot(scan, ForwardScanDirection, outslot))
 	{
-		found = true;
+		/* avoid expensive equality check if index is unique */
+		if (!indisunique && !tuples_equal(outslot, searchslot, eq))
+		{
+			/* we cannot skip tuples from an index if it is a unique index */
+			Assert (!GetRelationIdentityOrPK(idxoid));
+			continue;
+		}
+
 		ExecMaterializeSlot(outslot);
 
 		xwait = TransactionIdIsValid(snap.xmin) ?
@@ -167,6 +179,10 @@ retry:
 			XactLockTableWait(xwait, NULL, NULL, XLTW_None);
 			goto retry;
 		}
+
+		/* Found our tuple and it's not locked */
+		found = true;
+		break;
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
