@@ -553,6 +553,7 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 	part_entry = (LogicalRepPartMapEntry *) hash_search(LogicalRepPartMap,
 														(void *) &partOid,
 														HASH_ENTER, &found);
+	entry = &part_entry->relmapentry;
 
 	if (found && entry->localrelvalid)
 		return part_entry;
@@ -563,26 +564,11 @@ logicalrep_partition_open(LogicalRepRelMapEntry *root,
 	part_entry->partoid = partOid;
 	part_entry->usableIndexOid = LogicalRepUsableIndex(partrel, remoterel);
 
-	/* Remote relation is copied as-is from the root entry. */
-	entry = &part_entry->relmapentry;
-	entry->remoterel.remoteid = remoterel->remoteid;
-	entry->remoterel.nspname = pstrdup(remoterel->nspname);
-	entry->remoterel.relname = pstrdup(remoterel->relname);
-	entry->remoterel.natts = remoterel->natts;
-	entry->remoterel.attnames = palloc(remoterel->natts * sizeof(char *));
-	entry->remoterel.atttyps = palloc(remoterel->natts * sizeof(Oid));
-	for (i = 0; i < remoterel->natts; i++)
-	{
-		memset(part_entry, 0, sizeof(LogicalRepPartMapEntry));
-		part_entry->partoid = partOid;
-	}
-
 	if (!entry->remoterel.remoteid)
 	{
 		int			i;
 
 		/* Remote relation is copied as-is from the root entry. */
-		entry = &part_entry->relmapentry;
 		entry->remoterel.remoteid = remoterel->remoteid;
 		entry->remoterel.nspname = pstrdup(remoterel->nspname);
 		entry->remoterel.relname = pstrdup(remoterel->relname);
