@@ -1,9 +1,0 @@
-diff a/src/include/tcop/deparse_utility.h b/src/include/tcop/deparse_utility.h	(rejected hunks)
-@@ -62,6 +62,7 @@ typedef struct CollectedCommand
- 		{
- 			Oid			objectId;
- 			Oid			classId;
-+			bool		rewrite;
- 			List	   *subcmds;
- 		}			alterTable;
- 
