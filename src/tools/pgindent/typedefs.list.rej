@@ -1,0 +1,19 @@
+diff a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list	(rejected hunks)
+@@ -1621,6 +1621,9 @@ OSInfo
+ OSSLCipher
+ OSSLDigest
+ OVERLAPPED
++ObjElem
++ObjTree
++ObjType
+ ObjectAccessDrop
+ ObjectAccessNamespaceSearch
+ ObjectAccessPostAlter
+@@ -3182,6 +3185,7 @@ colormaprange
+ compare_context
+ config_var_value
+ contain_aggs_of_level_context
++convSpecifier
+ convert_testexpr_context
+ copy_data_source_cb
+ core_YYSTYPE
