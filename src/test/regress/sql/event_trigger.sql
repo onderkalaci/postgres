@@ -463,6 +463,18 @@ SELECT
     LATERAL pg_get_object_address(b.type, b.object_names, b.object_args) as a
   ORDER BY e.evtname;
 
+-- Create a heap2 table am handler with heapam handler
+CREATE TABLE heaptable USING heap AS
+SELECT a, repeat(a::text, 100) FROM generate_series(1,9) AS a;
+CREATE MATERIALIZED VIEW heapmv USING heap AS SELECT * FROM heaptable;
+
+-- we can rewrite materialized views when there are event triggers
+ALTER MATERIALIZED VIEW heapmv SET ACCESS METHOD heap2;
+
+-- clean up objects created for testing rewrite mat. view when event triggers exist
+DROP MATERIALIZED VIEW heapmv;
+DROP TABLE heaptable;
+
 DROP EVENT TRIGGER start_rls_command;
 DROP EVENT TRIGGER end_rls_command;
 DROP EVENT TRIGGER sql_drop_command;
