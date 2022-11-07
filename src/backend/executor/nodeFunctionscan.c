@@ -757,8 +757,8 @@ ExecBeginFunctionResult(FunctionScanState *node,
 					 * for functions returning RECORD, but might as well do it
 					 * always.
 					 */
-					perfunc->rsinfo.setDesc = perfunc->tupdesc;
-//					tupledesc_match(perfunc->tupdesc, rsinfo->setDesc);
+					//perfunc->rsinfo.setDesc = perfunc->tupdesc;
+					tupledesc_match(perfunc->tupdesc, perfunc->rsinfo.setDesc);
 				}
 
 				tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
@@ -972,7 +972,7 @@ ExecNextFunctionResult(FunctionScanState *node,
 				 * necessary in case the type is RECORD.
 				 */
 				ReturnSetInfo *rsinfo = (ReturnSetInfo *) perfunc->fcinfo->resultinfo;
-				tupdesc = rsinfo->setDesc;//perfunc->rsinfo.setDesc;
+				tupdesc = perfunc->rsinfo.setDesc;
 
 				if (HeapTupleHeaderGetTypeId(td) != tupdesc->tdtypeid ||
 					HeapTupleHeaderGetTypMod(td) != tupdesc->tdtypmod)
