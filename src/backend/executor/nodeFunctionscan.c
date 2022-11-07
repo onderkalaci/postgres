@@ -190,6 +190,8 @@ FunctionNext(FunctionScanState *node)
 	 */
 	if (node->ordinality)
 	{
+		ExecClearTuple(scanslot);
+
 		scanslot->tts_values[att] = Int64GetDatumFast(node->ordinal);
 		scanslot->tts_isnull[att] = false;
 	}
@@ -378,13 +380,13 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 		 * doing ordinality or multiple functions; otherwise, we'll fetch
 		 * function results directly into the scan slot.
 		 */
-		if (!scanstate->simple)
+		//if (!scanstate->simple)
 		{
 			fs->func_slot = ExecInitExtraTupleSlot(estate, fs->tupdesc,
 												   &TTSOpsMinimalTuple);
 		}
-		else
-			fs->func_slot = scanstate->ss.ss_ScanTupleSlot;
+		//else
+		//	fs->func_slot = scanstate->ss.ss_ScanTupleSlot;
 
 		natts += colcount;
 		i++;
@@ -617,28 +619,29 @@ ExecBeginFunctionResult(FunctionScanState *node,
 //			ReturnSetInfo rsinfo;
 //
 
-			//setexpr =
-			//	ExecInitFunctionResultSet(setexpr->expr, econtext, NULL);
+//			setexpr =
+//				ExecInitFunctionResultSet(setexpr->expr, econtext, NULL);
 
 			ReturnSetInfo *rsinfo = palloc0(sizeof(ReturnSetInfo));
 			rsinfo->type = T_ReturnSetInfo;
 			rsinfo->econtext = econtext;
-			rsinfo->expectedDesc = setexpr->funcResultDesc;
+			rsinfo->expectedDesc =  perfunc->tupdesc;
 			rsinfo->allowedModes = (int) (SFRM_ValuePerCall | SFRM_Materialize);
 			/* note we do not set SFRM_Materialize_Random or _Preferred */
 			rsinfo->returnMode = SFRM_ValuePerCall;
 			/* isDone is filled below */
 			rsinfo->setResult = NULL;
-			rsinfo->setDesc = NULL;
+			rsinfo->setDesc = perfunc->tupdesc;
 
 			setexpr->fcinfo->resultinfo = rsinfo;
 			perfunc->fcinfo = setexpr->fcinfo;
 
 			perfunc->started = true;
 
-			perfunc->func_slot = node->ss.ss_ScanTupleSlot;
+			//perfunc->func_slot = node->ss.ss_ScanTupleSlot;
 
 		}
+
 
 		returnsSet = setexpr->func.fn_retset;
 
@@ -698,7 +701,7 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		pgstat_init_function_usage(perfunc->fcinfo, &fcusage);
 
 		perfunc->fcinfo->isnull = false;
-		perfunc->rsinfo.isDone = ExprMultipleResult;
+		perfunc->rsinfo.isDone = returnsSet ? ExprMultipleResult : ExprSingleResult;
 		result = FunctionCallInvoke(perfunc->fcinfo);
 
 		pgstat_end_function_usage(&fcusage,
@@ -706,15 +709,18 @@ ExecBeginFunctionResult(FunctionScanState *node,
 	}
 	else
 	{
+		bool isNull = false;
 		perfunc->rsinfo.isDone = ExprSingleResult;
 		result = ExecEvalExpr(setexpr->elidedFuncState, econtext,
-							  &perfunc->fcinfo->isnull);
+							  &isNull);
 
 		/* done after this, will use SFRM_ValuePerCall branch below */
+		goto done;
 	}
 
 	/* Which protocol does function want to use? */
-	if (perfunc->rsinfo.returnMode == SFRM_ValuePerCall)
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) perfunc->fcinfo->resultinfo;
+	if (rsinfo->returnMode == SFRM_ValuePerCall)
 	{
 		/*
 		 * Check for end of result set.
@@ -751,13 +757,15 @@ ExecBeginFunctionResult(FunctionScanState *node,
 					 * for functions returning RECORD, but might as well do it
 					 * always.
 					 */
-					tupledesc_match(perfunc->tupdesc, perfunc->rsinfo.setDesc);
+					perfunc->rsinfo.setDesc = perfunc->tupdesc;
+//					tupledesc_match(perfunc->tupdesc, rsinfo->setDesc);
 				}
 
 				tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 				tmptup.t_data = td;
 
-				ExecStoreHeapTuple(&tmptup, perfunc->func_slot, false);
+				ExecStoreMinimalTuple(minimal_tuple_from_heap_tuple(&tmptup), perfunc->func_slot, false);
+
 				/* materializing handles expanded and toasted datums */
 				/* XXX: would be nice if this could be optimized away */
 				ExecMaterializeSlot(perfunc->func_slot);
@@ -777,15 +785,17 @@ ExecBeginFunctionResult(FunctionScanState *node,
 			 * Scalar-type case: just store the function result
 			 */
 			ExecClearTuple(perfunc->func_slot);
+			perfunc->func_slot->tts_tupleDescriptor = perfunc->tupdesc;
+
+
 			perfunc->func_slot->tts_values[0] = result;
 			perfunc->func_slot->tts_isnull[0] = perfunc->fcinfo->isnull;
 			ExecStoreVirtualTuple(perfunc->func_slot);
-
 			/* materializing handles expanded and toasted datums */
 			ExecMaterializeSlot(perfunc->func_slot);
 		}
 	}
-	else if (perfunc->rsinfo.returnMode == SFRM_Materialize)
+	else if (rsinfo->returnMode == SFRM_Materialize)
 	{
 		EState	   *estate;
 		ScanDirection direction;
@@ -794,44 +804,44 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		direction = estate->es_direction;
 
 		/* check we're on the same page as the function author */
-		if (perfunc->rsinfo.isDone != ExprSingleResult)
+		if (rsinfo->isDone != ExprSingleResult)
 			ereport(ERROR,
 					(errcode(ERRCODE_E_R_I_E_SRF_PROTOCOL_VIOLATED),
 					 errmsg("table-function protocol for materialize mode was not followed")));
 
-		if (perfunc->rsinfo.setResult != NULL)
+		if (rsinfo->setResult != NULL)
 		{
-			perfunc->tstore = perfunc->rsinfo.setResult;
+			perfunc->tstore = rsinfo->setResult;
 
 			/*
 			 * paranoia - cope if the function, which may have constructed the
 			 * tuplestore itself, didn't leave it pointing at the start. This
 			 * call is fast, so the overhead shouldn't be an issue.
 			 */
-			tuplestore_rescan(perfunc->rsinfo.setResult);
+			tuplestore_rescan(rsinfo->setResult);
 
 			/*
 			 * If function provided a tupdesc, cross-check it.  We only really need to
 			 * do this for functions returning RECORD, but might as well do it always.
 			 */
-			if (perfunc->rsinfo.setDesc)
+			if (rsinfo->setDesc)
 			{
-				tupledesc_match(perfunc->tupdesc, perfunc->rsinfo.setDesc);
+				tupledesc_match(perfunc->tupdesc, rsinfo->setDesc);
 
 				/*
 				 * If it is a dynamically-allocated TupleDesc, free it: it is
 				 * typically allocated in a per-query context, so we must avoid
 				 * leaking it across multiple usages.
 				 */
-				if (perfunc->rsinfo.setDesc->tdrefcount == -1)
+				if (rsinfo->setDesc->tdrefcount == -1)
 				{
-					FreeTupleDesc(perfunc->rsinfo.setDesc);
-					perfunc->rsinfo.setDesc = NULL;
+					FreeTupleDesc(rsinfo->setDesc);
+					rsinfo->setDesc = NULL;
 				}
 			}
 
 			/* and return first row */
-			(void) tuplestore_gettupleslot(perfunc->rsinfo.setResult,
+			(void) tuplestore_gettupleslot(rsinfo->setResult,
 										   ScanDirectionIsForward(direction),
 										   false,
 										   perfunc->func_slot);
@@ -841,7 +851,7 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_SRF_PROTOCOL_VIOLATED),
 				 errmsg("unrecognized table-function returnMode: %d",
-						(int) perfunc->rsinfo.returnMode)));
+						(int) rsinfo->returnMode)));
 	goto done;
 
 no_function_result:
@@ -923,6 +933,7 @@ ExecNextFunctionResult(FunctionScanState *node,
 			goto out;
 		}
 
+
 		if (perfunc->returnsTuple)
 		{
 			if (!perfunc->fcinfo->isnull)
@@ -955,22 +966,26 @@ ExecNextFunctionResult(FunctionScanState *node,
 					tupledesc_match(perfunc->tupdesc, perfunc->rsinfo.setDesc);
 				}
 
-				tupdesc = perfunc->rsinfo.setDesc;
 
 				/*
 				 * Verify all later returned rows have same subtype;
 				 * necessary in case the type is RECORD.
 				 */
+				ReturnSetInfo *rsinfo = (ReturnSetInfo *) perfunc->fcinfo->resultinfo;
+				tupdesc = rsinfo->setDesc;//perfunc->rsinfo.setDesc;
+
 				if (HeapTupleHeaderGetTypeId(td) != tupdesc->tdtypeid ||
 					HeapTupleHeaderGetTypMod(td) != tupdesc->tdtypmod)
-					ereport(ERROR,
+					ereport(NOTICE,
 							(errcode(ERRCODE_DATATYPE_MISMATCH),
 							 errmsg("rows returned by function are not all of the same row type")));
 
 				tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 				tmptup.t_data = td;
 
-				ExecStoreHeapTuple(&tmptup, perfunc->func_slot, false);
+				//ExecStoreHeapTuple(&tmptup, perfunc->func_slot, false);
+				ExecStoreMinimalTuple(minimal_tuple_from_heap_tuple(&tmptup), perfunc->func_slot, false);
+
 				/* materializing handles expanded and toasted datums */
 				/* XXX: would be nice if this could be optimized away */
 				ExecMaterializeSlot(perfunc->func_slot);
