@@ -614,33 +614,25 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		/*
 		 * Initialize function cache if first time through
 		 */
-		if (!perfunc->started)
+		if (setexpr->func.fn_oid == InvalidOid)
  		{
-//			ReturnSetInfo rsinfo;
-//
 
-//			setexpr =
-//				ExecInitFunctionResultSet(setexpr->expr, econtext, NULL);
 
-			ReturnSetInfo *rsinfo = palloc0(sizeof(ReturnSetInfo));
-			rsinfo->type = T_ReturnSetInfo;
-			rsinfo->econtext = econtext;
-			rsinfo->expectedDesc =  perfunc->tupdesc;
-			rsinfo->allowedModes = (int) (SFRM_ValuePerCall | SFRM_Materialize);
-			/* note we do not set SFRM_Materialize_Random or _Preferred */
-			rsinfo->returnMode = SFRM_ValuePerCall;
-			/* isDone is filled below */
-			rsinfo->setResult = NULL;
-			rsinfo->setDesc = perfunc->tupdesc;
+			setexpr = ExecInitTableFunctionResult(setexpr->expr, econtext, NULL);
+ 		}
 
-			setexpr->fcinfo->resultinfo = rsinfo;
-			perfunc->fcinfo = setexpr->fcinfo;
+		ReturnSetInfo *rsinfo = palloc0(sizeof(ReturnSetInfo));
+		rsinfo->type = T_ReturnSetInfo;
+		rsinfo->econtext = econtext;
+		rsinfo->expectedDesc =  perfunc->tupdesc;
+		rsinfo->allowedModes = (int) (SFRM_ValuePerCall | SFRM_Materialize);
+		/* note we do not set SFRM_Materialize_Random or _Preferred */
+		rsinfo->returnMode = SFRM_ValuePerCall;
+		/* isDone is filled below */
+		rsinfo->setResult = NULL;
+		rsinfo->setDesc = perfunc->tupdesc;
 
-			perfunc->started = true;
-
-			//perfunc->func_slot = node->ss.ss_ScanTupleSlot;
-
-		}
+		perfunc->setexpr->fcinfo->resultinfo = rsinfo;
 
 
 		returnsSet = setexpr->func.fn_retset;
@@ -656,7 +648,7 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		 * and can be reset each time the node is re-scanned.
 		 */
 		oldcontext = MemoryContextSwitchTo(node->argcontext);
-		ExecEvalFuncArgs(perfunc->fcinfo, setexpr->args, econtext);
+		ExecEvalFuncArgs(setexpr->fcinfo, setexpr->args, econtext);
 		MemoryContextSwitchTo(oldcontext);
 
 		/*
@@ -668,9 +660,9 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		{
 			int			i;
 
-			for (i = 0; i < perfunc->fcinfo->nargs; i++)
+			for (i = 0; i < perfunc->setexpr->fcinfo->nargs; i++)
  			{
-				if (perfunc->fcinfo->args[i].isnull)
+				if (perfunc->setexpr->fcinfo->args[i].isnull)
 					goto no_function_result;
  			}
 		}
@@ -686,46 +678,55 @@ ExecBeginFunctionResult(FunctionScanState *node,
 	 */
 	MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
+	//
+
 	/*
 	 * reset per-tuple memory context before each call of the function or
 	 * expression. This cleans up any local memory the function may leak
 	 * when called.
 	 */
 	ResetExprContext(econtext);
+	bool isNull = false;
 
 	/* Call the function or expression one time */
 	if (direct_function_call)
 	{
 		PgStat_FunctionCallUsage fcusage;
 
-		pgstat_init_function_usage(perfunc->fcinfo, &fcusage);
+		pgstat_init_function_usage(perfunc->setexpr->fcinfo, &fcusage);
 
-		perfunc->fcinfo->isnull = false;
+		perfunc->setexpr->fcinfo->isnull = false;
 		perfunc->rsinfo.isDone = returnsSet ? ExprMultipleResult : ExprSingleResult;
-		result = FunctionCallInvoke(perfunc->fcinfo);
 
+		result = FunctionCallInvoke(perfunc->setexpr->fcinfo);
+
+		isNull = perfunc->setexpr->fcinfo->isnull;
 		pgstat_end_function_usage(&fcusage,
 								  perfunc->rsinfo.isDone != ExprMultipleResult);
 	}
 	else
 	{
-		bool isNull = false;
 		perfunc->rsinfo.isDone = ExprSingleResult;
 		result = ExecEvalExpr(setexpr->elidedFuncState, econtext,
 							  &isNull);
 
 		/* done after this, will use SFRM_ValuePerCall branch below */
-		goto done;
 	}
 
 	/* Which protocol does function want to use? */
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) perfunc->fcinfo->resultinfo;
+	ReturnSetInfo *rsinfo = NULL;
+
+	if (perfunc->setexpr->fcinfo != NULL)
+		rsinfo = perfunc->setexpr->fcinfo->resultinfo;
+	else
+		rsinfo = &perfunc->rsinfo;
+
 	if (rsinfo->returnMode == SFRM_ValuePerCall)
 	{
 		/*
 		 * Check for end of result set.
 		 */
-		if (perfunc->rsinfo.isDone == ExprEndResult)
+		if (rsinfo->isDone == ExprEndResult)
 			goto no_function_result;
 
 		/*
@@ -733,7 +734,7 @@ ExecBeginFunctionResult(FunctionScanState *node,
 		 */
 		if (perfunc->returnsTuple)
 		{
-			if (!perfunc->fcinfo->isnull)
+			if (!isNull)
 			{
 				HeapTupleHeader td = DatumGetHeapTupleHeader(result);
 				HeapTupleData tmptup;
@@ -776,7 +777,7 @@ ExecBeginFunctionResult(FunctionScanState *node,
 				 * NULL result from a tuple-returning function; expand it
 				 * to a row of all nulls.
 				 */
-				ExecStoreAllNullTuple(perfunc->func_slot);
+				//ExecStoreAllNullTuple(perfunc->func_slot);
 			}
 		}
 		else
@@ -787,9 +788,8 @@ ExecBeginFunctionResult(FunctionScanState *node,
 			ExecClearTuple(perfunc->func_slot);
 			perfunc->func_slot->tts_tupleDescriptor = perfunc->tupdesc;
 
-
 			perfunc->func_slot->tts_values[0] = result;
-			perfunc->func_slot->tts_isnull[0] = perfunc->fcinfo->isnull;
+			perfunc->func_slot->tts_isnull[0] = isNull;
 			ExecStoreVirtualTuple(perfunc->func_slot);
 			/* materializing handles expanded and toasted datums */
 			ExecMaterializeSlot(perfunc->func_slot);
@@ -833,10 +833,10 @@ ExecBeginFunctionResult(FunctionScanState *node,
 				 * typically allocated in a per-query context, so we must avoid
 				 * leaking it across multiple usages.
 				 */
-				if (rsinfo->setDesc->tdrefcount == -1)
+				//if (rsinfo->setDesc->tdrefcount == -1)
 				{
-					FreeTupleDesc(rsinfo->setDesc);
-					rsinfo->setDesc = NULL;
+					//FreeTupleDesc(rsinfo->setDesc);
+					//rsinfo->setDesc = NULL;
 				}
 			}
 
@@ -869,6 +869,8 @@ no_function_result:
 		ExecStoreAllNullTuple(perfunc->func_slot);
 done:
 	MemoryContextSwitchTo(callerContext);
+
+	perfunc->started = true;
 }
 
 static void
@@ -911,21 +913,17 @@ ExecNextFunctionResult(FunctionScanState *node,
 		MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
 		/* next call in percall mode */
-		pgstat_init_function_usage(perfunc->fcinfo, &fcusage);
+		pgstat_init_function_usage(perfunc->setexpr->fcinfo, &fcusage);
 
-		perfunc->fcinfo->isnull = false;
+		perfunc->setexpr->fcinfo->isnull = false;
 		//perfunc->rsinfo.isDone = ExprSingleResult;
-		result = FunctionCallInvoke(perfunc->fcinfo);
+		result = FunctionCallInvoke(perfunc->setexpr->fcinfo);
 
-
-		//elog(WARNING, "perfunc->fcinfo->resultinfo: %d", ((ReturnSetInfo *)(perfunc->fcinfo)->resultinfo)->isDone);
-		//elog(WARNING, "perfunc->rsinfo.isDone: %d", perfunc->rsinfo.isDone);
-
-		int isDone = ((ReturnSetInfo *)(perfunc->fcinfo)->resultinfo)->isDone;
+		int isDone = ((ReturnSetInfo *)(perfunc->setexpr->fcinfo)->resultinfo)->isDone;
 		pgstat_end_function_usage(&fcusage,
 								isDone != ExprMultipleResult);
 
-		Assert(perfunc->rsinfo.returnMode == SFRM_ValuePerCall);
+//		Assert(perfunc->setexpr->rsinfo.returnMode == SFRM_ValuePerCall);
 
 		if (isDone == ExprEndResult)
 		{
@@ -936,7 +934,7 @@ ExecNextFunctionResult(FunctionScanState *node,
 
 		if (perfunc->returnsTuple)
 		{
-			if (!perfunc->fcinfo->isnull)
+			if (!perfunc->setexpr->fcinfo->isnull)
 			{
 				HeapTupleHeader td = DatumGetHeapTupleHeader(result);
 				HeapTupleData tmptup;
@@ -971,7 +969,6 @@ ExecNextFunctionResult(FunctionScanState *node,
 				 * Verify all later returned rows have same subtype;
 				 * necessary in case the type is RECORD.
 				 */
-				ReturnSetInfo *rsinfo = (ReturnSetInfo *) perfunc->fcinfo->resultinfo;
 				tupdesc = perfunc->rsinfo.setDesc;
 
 				if (HeapTupleHeaderGetTypeId(td) != tupdesc->tdtypeid ||
@@ -1000,7 +997,7 @@ ExecNextFunctionResult(FunctionScanState *node,
 			/* Scalar-type case: just store the function result */
 			ExecClearTuple(perfunc->func_slot);
 			perfunc->func_slot->tts_values[0] = result;
-			perfunc->func_slot->tts_isnull[0] = perfunc->fcinfo->isnull;
+			perfunc->func_slot->tts_isnull[0] = perfunc->setexpr->fcinfo->isnull;
 			ExecStoreVirtualTuple(perfunc->func_slot);
 
 			/* materializing handles expanded and toasted datums */
