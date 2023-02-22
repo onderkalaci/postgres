@@ -88,6 +88,102 @@ $node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
 # ====================================================================
 
 # ====================================================================
+# Testcase start: SUBSCRIPTION DISABLED INDEX SCAN
+#
+# Show that enable_index_scan option for CREATE SUBSCRIPTION and
+# ALTER SUBSCRIPTION works as intended
+#
+
+# create tables pub and sub
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE test_replica_id_full (x int)");
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE test_replica_id_full REPLICA IDENTITY FULL;");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE test_replica_id_full (x int)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full(x)");
+
+# insert some initial data
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO test_replica_id_full SELECT i FROM generate_series(0,21)i;");
+
+# create pub/sub
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_rep_full FOR TABLE test_replica_id_full");
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_rep_full CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub_rep_full WITH (enable_index_scan = false)"
+);
+
+# wait for initial table synchronization to finish
+$node_subscriber->wait_for_subscription_sync;
+
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_replica_id_full SET x = x + 1 WHERE x = 15;");
+$node_publisher->wait_for_catchup($appname);
+
+# show that index is not used for UPDATE
+$node_subscriber->poll_query_until(
+	'postgres', q{select (idx_scan = 0) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+) or die "Timed out while waiting for check subscriber tap_sub_rep_full updates one row via index";
+
+$node_publisher->safe_psql('postgres',
+	"DELETE FROM test_replica_id_full WHERE x = 20;");
+$node_publisher->wait_for_catchup($appname);
+
+# show that index is not used for DELETE
+$node_subscriber->poll_query_until(
+	'postgres', q{select (idx_scan = 0) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+) or die "Timed out while waiting for check subscriber tap_sub_rep_full deletes one row via index";
+
+# now, enable the index scan via ALTER SUBSCRIPTION command
+# and show that we can control the behavior of using index
+$node_subscriber->safe_psql('postgres',
+	"ALTER SUBSCRIPTION tap_sub_rep_full SET (enable_index_scan = true)"
+);
+
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_replica_id_full SET x = x + 1 WHERE x = 5;");
+$node_publisher->wait_for_catchup($appname);
+
+# show that index is used for UPDATE as we changed enable_index_scan to true
+$node_subscriber->poll_query_until(
+	'postgres', q{select (idx_scan = 1) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+) or die "Timed out while waiting for check subscriber tap_sub_rep_full updates one row via index";
+
+
+# now, disable the index scan via ALTER SUBSCRIPTION command
+# and show that we can control the behavior of using index
+$node_subscriber->safe_psql('postgres',
+	"ALTER SUBSCRIPTION tap_sub_rep_full SET (enable_index_scan = false)"
+);
+
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_replica_id_full SET x = x + 1 WHERE x = 8;");
+$node_publisher->wait_for_catchup($appname);
+
+# show that index is not used for UPDATE as we changed enable_index_scan to false
+$node_subscriber->poll_query_until(
+	'postgres', q{select (idx_scan = 1) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+) or die "Timed out while waiting for check subscriber tap_sub_rep_full updates one row via index";
+
+
+# make sure that the subscriber has the correct data
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(DISTINCT x) FROM test_replica_id_full");
+is($result, qq(18), 'ensure subscriber has the correct data at the end of the test');
+
+# cleanup pub
+$node_publisher->safe_psql('postgres', "DROP PUBLICATION tap_pub_rep_full");
+$node_publisher->safe_psql('postgres', "DROP TABLE test_replica_id_full");
+# cleanup sub
+$node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub_rep_full");
+$node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
+
+# Testcase end: SUBSCRIPTION DISABLED INDEX SCAN
+# ====================================================================
+
+# ====================================================================
 # Testcase start: SUBSCRIPTION CREATE/DROP INDEX WORKS WITHOUT ISSUES
 #
 # This test ensures that after CREATE INDEX, the subscriber can automatically
