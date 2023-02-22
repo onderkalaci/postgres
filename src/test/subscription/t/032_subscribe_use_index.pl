@@ -88,6 +88,81 @@ $node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
 # ====================================================================
 
 # ====================================================================
+# Testcase start: SUBSCRIPTION USES INDEX WITH PUB/SUB different data
+#
+# The subscriber has duplicate tuples that publisher does not have.
+# When publsher updates/deletes 1 row, subscriber uses indexes and
+# exactly updates/deletes 1 row.
+#
+
+# create tables pub and sub
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE test_replica_id_full (x int)");
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE test_replica_id_full REPLICA IDENTITY FULL;");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE test_replica_id_full (x int)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full(x)");
+
+# insert some initial data
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO test_replica_id_full SELECT i FROM generate_series(0,21)i;");
+
+# create pub/sub
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_rep_full FOR TABLE test_replica_id_full");
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_rep_full CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub_rep_full"
+);
+
+# wait for initial table synchronization to finish
+$node_subscriber->wait_for_subscription_sync;
+
+
+# duplicate the data in subscriber
+$node_subscriber->safe_psql('postgres',
+	"INSERT INTO test_replica_id_full SELECT i FROM generate_series(0,21)i;");
+$node_publisher->wait_for_catchup($appname);
+
+# now, we update only 1 row on the publisher and expect
+# the subscriber to only update 1 row
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_replica_id_full SET x = x + 1 WHERE x = 15;");
+$node_publisher->wait_for_catchup($appname);
+
+# wait until the index is used on the subscriber
+$node_subscriber->poll_query_until(
+	'postgres', q{select (idx_scan = 1) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+) or die "Timed out while waiting for check subscriber tap_sub_rep_full updates one row via index";
+
+# similarly for delete
+$node_publisher->safe_psql('postgres',
+	"DELETE FROM test_replica_id_full WHERE x = 20;");
+$node_publisher->wait_for_catchup($appname);
+
+# wait until the index is used on the subscriber
+$node_subscriber->poll_query_until(
+	'postgres', q{select (idx_scan = 2) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+) or die "Timed out while waiting for check subscriber tap_sub_rep_full deletes one row via index";
+
+# make sure that the subscriber has the correct data
+# we only deleted 1 row
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(*) FROM test_replica_id_full");
+is($result, qq(43), 'ensure subscriber has the correct data at the end of the test');
+
+# cleanup pub
+$node_publisher->safe_psql('postgres', "DROP PUBLICATION tap_pub_rep_full");
+$node_publisher->safe_psql('postgres', "DROP TABLE test_replica_id_full");
+# cleanup sub
+$node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub_rep_full");
+$node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
+
+# Testcase end: SUBSCRIPTION USES INDEX WITH PUB/SUB different data
+# ====================================================================
+
+# ====================================================================
 # Testcase start: SUBSCRIPTION DISABLED INDEX SCAN
 #
 # Show that enable_index_scan option for CREATE SUBSCRIPTION and
