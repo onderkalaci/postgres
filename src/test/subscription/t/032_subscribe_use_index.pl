@@ -595,12 +595,15 @@ $node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
 # Testcase end: Unique index that is not primary key or replica identity
 # =============================================================================
 
-# ====================================================================
-# Testcase start: SUBSCRIPTION BEHAVIOR WITH ENABLE_INDEXSCAN
+# =============================================================================
+# Testcase start: SUBSCRIPTION BEHAVIOR WITH
+# enable_replica_identity_full_index_scan=false
 #
-# Even if enable_indexscan = false, we do use the primary keys, this
-# is the legacy behavior. However, we do not use non-primary/non replica
-# identity columns.
+# When the table has storage parameter enable_replica_identity_full_index_scan = false,
+# even if there is a suitable index to use.
+#
+# Note that this is not relevant when the table has PK/RI. In that case, index is
+# always used.
 #
 
 # create tables pub and sub
@@ -609,13 +612,9 @@ $node_publisher->safe_psql('postgres',
 $node_publisher->safe_psql('postgres',
 	"ALTER TABLE test_replica_id_full REPLICA IDENTITY FULL;");
 $node_subscriber->safe_psql('postgres',
-	"CREATE TABLE test_replica_id_full (x int NOT NULL)");
+	"CREATE TABLE test_replica_id_full (x int NOT NULL) WITH (enable_replica_identity_full_index_scan = false)");
 $node_subscriber->safe_psql('postgres',
 	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full(x)");
-$node_subscriber->safe_psql('postgres',
-	"ALTER SYSTEM SET enable_indexscan TO off;");
-$node_subscriber->safe_psql('postgres',
-	"SELECT pg_reload_conf();");
 
 # insert some initial data
 $node_publisher->safe_psql('postgres',
@@ -635,10 +634,10 @@ $node_publisher->safe_psql('postgres',
 	"UPDATE test_replica_id_full SET x = x + 10000 WHERE x = 15;");
 $node_publisher->wait_for_catchup($appname);
 
-# show that index is not used when enable_indexscan=false
+# show that index is not used when enable_replica_identity_full_index_scan=false
 $result = $node_subscriber->safe_psql('postgres',
 	"select idx_scan from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx'");
-is($result, qq(0), 'ensure subscriber has not used index with enable_indexscan=false');
+is($result, qq(0), 'ensure subscriber has not used index with enable_replica_identity_full_index_scan=false');
 
 # we are done with this index, drop to simplify the tests
 $node_subscriber->safe_psql('postgres',
@@ -663,11 +662,11 @@ $node_publisher->wait_for_catchup($appname);
 # this is a legacy behavior
 $node_subscriber->poll_query_until(
 	'postgres', q{select (idx_scan=1) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_unique'}
-) or die "Timed out while waiting ensuring subscriber used unique index as replica identity even with enable_indexscan=false";
+) or die "Timed out while waiting ensuring subscriber used unique index as replica identity even with enable_replica_identity_full_index_scan=false";
 
 $result = $node_subscriber->safe_psql('postgres',
 	"SELECT count(*) FROM test_replica_id_full WHERE x IN (14,15)");
-is($result, qq(0), 'ensure the results are accurate even with enable_indexscan=false');
+is($result, qq(0), 'ensure the results are accurate even with enable_replica_identity_full_index_scan=false');
 
 # cleanup pub
 $node_publisher->safe_psql('postgres', "DROP PUBLICATION tap_pub_rep_full");
@@ -676,13 +675,9 @@ $node_publisher->safe_psql('postgres', "DROP TABLE test_replica_id_full");
 $node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub_rep_full");
 $node_subscriber->safe_psql('postgres', "DROP TABLE test_replica_id_full");
 
-$node_subscriber->safe_psql('postgres',
-	"ALTER SYSTEM RESET enable_indexscan;");
-$node_subscriber->safe_psql('postgres',
-	"SELECT pg_reload_conf();");
-
-# Testcase end: SUBSCRIPTION BEHAVIOR WITH ENABLE_INDEXSCAN
-# ====================================================================
+# Testcase end: SUBSCRIPTION BEHAVIOR WITH
+# enable_replica_identity_full_index_scan=false
+# =============================================================================
 
 # =============================================================================
 # Testcase start: SUBSCRIPTION USES INDEX WITH PUB/SUB different data

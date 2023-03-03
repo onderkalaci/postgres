@@ -336,6 +336,8 @@ typedef struct StdRdOptions
 	int			toast_tuple_target; /* target for tuple toasting */
 	AutoVacOpts autovacuum;		/* autovacuum-related options */
 	bool		user_catalog_table; /* use as an additional catalog relation */
+	bool		enable_replica_identity_full_index_scan; /* enables index scan
+															for RI full */
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
@@ -384,6 +386,16 @@ typedef struct StdRdOptions
 	 ((relation)->rd_rel->relkind == RELKIND_RELATION || \
 	  (relation)->rd_rel->relkind == RELKIND_MATVIEW) ? \
 	 ((StdRdOptions *) (relation)->rd_options)->user_catalog_table : false)
+
+/*
+ * RelationReplicaIdentityFullIndexScanEnabled
+ *		Returns whether index scan must be enabled when replica
+ *		identity is full.
+ */
+#define RelationReplicaIdentityFullIndexScanEnabled(relation)	\
+	((relation)->rd_options && \
+	 (relation)->rd_rel->relkind == RELKIND_RELATION ? \
+	 ((StdRdOptions *) (relation)->rd_options)->enable_replica_identity_full_index_scan : true)
 
 /*
  * RelationGetParallelWorkers

@@ -873,7 +873,8 @@ FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel)
 	if (OidIsValid(idxoid))
 		return idxoid;
 
-	if (remoterel->replident == REPLICA_IDENTITY_FULL)
+	if (RelationReplicaIdentityFullIndexScanEnabled(localrel) &&
+		remoterel->replident == REPLICA_IDENTITY_FULL)
 	{
 		/*
 		 * We are looking for one more opportunity for using an index. If
