@@ -137,8 +137,8 @@ build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel,
  * contents, and return true.  Return false otherwise.
  */
 bool
-RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
-							 LockTupleMode lockmode,
+RelationFindReplTupleByIndex(Relation rel, LogicalRepRelation *remoterel,
+							 Oid idxoid, LockTupleMode lockmode,
 							 TupleTableSlot *searchslot,
 							 TupleTableSlot *outslot)
 {
@@ -150,12 +150,12 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 	Relation	idxrel;
 	bool		found;
 	TypeCacheEntry **eq = NULL;
-	bool		idxIsRelationIdentityOrPK;
+	bool		isIdxSafeToSkipDuplicates;
 
 	/* Open the index. */
 	idxrel = index_open(idxoid, RowExclusiveLock);
 
-	idxIsRelationIdentityOrPK = IdxIsRelationIdentityOrPK(rel, idxoid);
+	isIdxSafeToSkipDuplicates = IsIdxSafeToSkipDuplicates(rel, idxrel, remoterel);
 
 	InitDirtySnapshot(snap);
 
@@ -174,10 +174,9 @@ retry:
 	while (index_getnext_slot(scan, ForwardScanDirection, outslot))
 	{
 		/*
-		 * Avoid expensive equality check if the index is primary key or
-		 * replica identity index.
+		 * Avoid expensive equality check if the index is unique.
 		 */
-		if (!idxIsRelationIdentityOrPK)
+		if (!isIdxSafeToSkipDuplicates)
 		{
 			if (eq == NULL)
 			{

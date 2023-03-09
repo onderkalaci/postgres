@@ -634,7 +634,8 @@ extern void check_exclusion_constraint(Relation heap, Relation index,
 /*
  * prototypes from functions in execReplication.c
  */
-extern bool RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
+#include "replication/logicalproto.h"
+extern bool RelationFindReplTupleByIndex(Relation rel, LogicalRepRelation *remoterel, Oid idxoid,
 										 LockTupleMode lockmode,
 										 TupleTableSlot *searchslot,
 										 TupleTableSlot *outslot);

@@ -49,7 +49,9 @@ extern LogicalRepRelMapEntry *logicalrep_partition_open(LogicalRepRelMapEntry *r
 extern void logicalrep_rel_close(LogicalRepRelMapEntry *rel,
 								 LOCKMODE lockmode);
 extern bool IsIndexUsableForReplicaIdentityFull(IndexInfo *indexInfo);
+extern bool AllIndexColumnsProvided(IndexInfo  *indexInfo, LogicalRepRelation *remoterel);
 extern Oid GetRelationIdentityOrPK(Relation rel);
-extern bool IdxIsRelationIdentityOrPK(Relation rel, Oid idxoid);
-
+extern bool IsIdxSafeToSkipDuplicates(Relation localrel, Relation idxrel,
+									  LogicalRepRelation *remoterel);
+extern bool IndexHasPkeyCharacterstics(IndexInfo  *indexInfo, Relation localrel);
 #endif							/* LOGICALRELATION_H */

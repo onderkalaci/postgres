@@ -2846,7 +2846,7 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 		   (remoterel->replident == REPLICA_IDENTITY_FULL));
 
 	if (OidIsValid(localidxoid))
-		found = RelationFindReplTupleByIndex(localrel, localidxoid,
+		found = RelationFindReplTupleByIndex(localrel, remoterel, localidxoid,
 											 LockTupleExclusive,
 											 remoteslot, *localslot);
 	else

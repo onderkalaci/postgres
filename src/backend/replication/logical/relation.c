@@ -27,6 +27,7 @@
 #include "replication/logicalrelation.h"
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
+#include "utils/syscache.h"
 
 
 static MemoryContext LogicalRepRelMapContext = NULL;
@@ -772,6 +773,76 @@ IndexContainsAnyRemoteColumn(IndexInfo  *indexInfo,
 }
 
 /*
+ * WIP
+ */
+bool
+AllIndexColumnsProvided(IndexInfo  *indexInfo, LogicalRepRelation  *remoterel)
+{
+	int indexColumnMatchCount = 0;
+	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+	{
+		int			keycol = indexInfo->ii_IndexAttrNumbers[i];
+
+		if (!AttributeNumberIsValid(keycol))
+				return false;
+
+		if (bms_is_member( keycol- 1, remoterel->attkeys))
+			indexColumnMatchCount++;
+	}
+
+	if (indexColumnMatchCount != indexInfo->ii_NumIndexAttrs)
+		return false;
+
+	return true;
+}
+
+bool
+IndexHasPkeyCharacterstics(IndexInfo  *indexInfo, Relation localrel)
+{
+
+	if (!indexInfo->ii_Unique)
+			return false;
+
+	if (!indexInfo->ii_NullsNotDistinct)
+		return false;
+
+	/*
+	 * Check that all of the attributes in a primary key are marked as not
+	 * null.  (We don't really expect to see that; it'd mean the parser messed
+	 * up.  But it seems wise to check anyway.)
+	 */
+	for (int i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
+	{
+		AttrNumber	attnum = indexInfo->ii_IndexAttrNumbers[i];
+		HeapTuple	atttuple;
+		Form_pg_attribute attform;
+
+		if (attnum == 0)
+			return false;
+
+		/* System attributes are never null, so no need to check */
+		if (attnum < 0)
+			return false;
+
+		atttuple = SearchSysCache2(ATTNUM,
+								   ObjectIdGetDatum(RelationGetRelid(localrel)),
+								   Int16GetDatum(attnum));
+		if (!HeapTupleIsValid(atttuple))
+			return false;
+
+		attform = (Form_pg_attribute) GETSTRUCT(atttuple);
+
+		if (!attform->attnotnull)
+			return false;
+
+		ReleaseSysCache(atttuple);
+	}
+
+	return true;
+
+}
+
+/*
  * Returns the oid of an index that can be used by the apply worker to scan
  * the relation. The index must be btree, non-partial, and have at least
  * one column reference (i.e. cannot consist of only expressions). These
@@ -859,18 +930,17 @@ GetRelationIdentityOrPK(Relation rel)
 }
 
 /*
- * Given a relation and OID of an index, returns true if the index is relation's
- * replica identity index or relation's primary key's index.
+ * Given index relation, returns true if the index is unique.
  *
  * Returns false otherwise.
  */
 bool
-IdxIsRelationIdentityOrPK(Relation rel, Oid idxoid)
+IsIdxSafeToSkipDuplicates(Relation localrel, Relation idxrel, LogicalRepRelation *remoterel)
 {
-	Assert(OidIsValid(idxoid));
+	IndexInfo  *indexInfo = BuildIndexInfo(idxrel);
 
-	return RelationGetReplicaIndex(rel) == idxoid ||
-		RelationGetPrimaryKeyIndex(rel) == idxoid;
+	return	AllIndexColumnsProvided(indexInfo, remoterel) &&
+			IndexHasPkeyCharacterstics(indexInfo, localrel);
 }
 
 /*
