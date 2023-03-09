@@ -750,6 +750,27 @@ IsIndexOnlyOnExpression(IndexInfo *indexInfo)
 	return true;
 }
 
+
+/*
+ * Returns true if the index contains any of the columns remoterel
+ * has.
+ */
+static bool
+IndexContainsAnyRemoteColumn(IndexInfo  *indexInfo,
+							 LogicalRepRelation  *remoterel)
+{
+	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+	{
+		int			keycol = indexInfo->ii_IndexAttrNumbers[i];
+
+		if (AttributeNumberIsValid(keycol) &&
+			bms_is_member( keycol- 1, remoterel->attkeys))
+			return true;
+	}
+
+	return false;
+}
+
 /*
  * Returns the oid of an index that can be used by the apply worker to scan
  * the relation. The index must be btree, non-partial, and have at least
@@ -775,7 +796,7 @@ IsIndexOnlyOnExpression(IndexInfo *indexInfo)
  * If no suitable index is found, returns InvalidOid.
  */
 static Oid
-FindUsableIndexForReplicaIdentityFull(Relation localrel)
+FindUsableIndexForReplicaIdentityFull(Relation localrel, LogicalRepRelation *remoterel)
 {
 	List	   *indexlist = RelationGetIndexList(localrel);
 	Oid			usableIndex = InvalidOid;
@@ -785,14 +806,16 @@ FindUsableIndexForReplicaIdentityFull(Relation localrel)
 	{
 		Oid			idxoid = lfirst_oid(lc);
 		bool		isUsableIndex;
+		bool		indexContainsAnyRemoteColumn;
 		Relation	indexRelation = index_open(idxoid, AccessShareLock);
 		IndexInfo  *indexInfo = BuildIndexInfo(indexRelation);
 
 		isUsableIndex = IsIndexUsableForReplicaIdentityFull(indexInfo);
+		indexContainsAnyRemoteColumn = IndexContainsAnyRemoteColumn(indexInfo, remoterel);
 
 		index_close(indexRelation, AccessShareLock);
 
-		if (isUsableIndex)
+		if (isUsableIndex && indexContainsAnyRemoteColumn)
 		{
 			/* we found one eligible index, don't need to continue */
 			usableIndex = idxoid;
@@ -891,7 +914,7 @@ FindLogicalRepLocalIndex(Relation localrel, LogicalRepRelation *remoterel)
 		 * long run or use the full-fledged planner which could cause
 		 * overhead.
 		 */
-		return FindUsableIndexForReplicaIdentityFull(localrel);
+		return FindUsableIndexForReplicaIdentityFull(localrel, remoterel);
 	}
 
 	return InvalidOid;

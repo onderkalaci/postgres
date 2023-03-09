@@ -771,7 +771,7 @@ $node_publisher->safe_psql('postgres',
 $node_subscriber->safe_psql('postgres',
 	"CREATE TABLE test_replica_id_full (x int, y int)");
 $node_subscriber->safe_psql('postgres',
-	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full(y)");
+	"CREATE INDEX test_replica_id_full_idy1 ON test_replica_id_full(y)");
 
 # insert some initial data
 $node_publisher->safe_psql('postgres',
@@ -793,9 +793,9 @@ $node_publisher->safe_psql('postgres',
 	"UPDATE test_replica_id_full SET x = x + 1 WHERE x = 15;");
 $node_publisher->wait_for_catchup($appname);
 
-# wait until the index is used on the subscriber
+# show that the index is not used on the subscriber
 $node_subscriber->poll_query_until(
-	'postgres', q{select (idx_scan = 1) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idx';}
+	'postgres', q{select (idx_scan = 0) from pg_stat_all_indexes where indexrelname = 'test_replica_id_full_idy1';}
 ) or die "Timed out while waiting for check subscriber tap_sub_rep_full updates one row via index";
 
 # make sure that the subscriber has the correct data
