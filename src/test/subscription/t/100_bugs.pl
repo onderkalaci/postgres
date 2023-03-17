@@ -373,4 +373,71 @@ is( $result, qq(1
 $node_publisher->stop('fast');
 $node_subscriber->stop('fast');
 
+# https://www.postgresql.org/message-id/CACawEhUu6S8E4Oo7%2Bs5iaq%3DyLRZJb6uOZeEQSGJj-7NVkDzSaw%40mail.gmail.com
+
+# The bug was that when the REPLICA IDENTITY FULL is used with dropped
+# or generated columns, the equality checks for the tuples was trying to
+# compare NULL Datum values (coming from slot_store_data()) with the
+# non-visible actua Datum values (coming from table_scan_getnextslot()).
+my $node_publisher_d_cols = PostgreSQL::Test::Cluster->new('node_publisher_d_cols');
+$node_publisher_d_cols->init(allows_streaming => 'logical');
+$node_publisher_d_cols->start;
+
+my $node_subscriber_d_cols = PostgreSQL::Test::Cluster->new('node_subscriber_d_cols');
+$node_subscriber_d_cols->init(allows_streaming => 'logical');
+$node_subscriber_d_cols->start;
+
+$node_publisher_d_cols->safe_psql(
+	'postgres', qq(
+	CREATE TABLE dropped_cols (a int, b_drop int, c int);
+	ALTER TABLE dropped_cols REPLICA IDENTITY FULL;
+
+	CREATE TABLE generated_cols (a int, b_gen int GENERATED ALWAYS AS (5 * a) STORED, c int);
+	ALTER TABLE generated_cols REPLICA IDENTITY FULL;
+
+	CREATE PUBLICATION pub_dropped_cols FOR TABLE dropped_cols, generated_cols;
+
+	-- some initial data
+	INSERT INTO dropped_cols VALUES (1, 1, 1);
+	INSERT INTO generated_cols (a,c) VALUES (1, 1);
+));
+
+$node_subscriber_d_cols->safe_psql(
+	'postgres', qq(
+	 CREATE TABLE dropped_cols (a int, b_drop int, c int);
+	 CREATE TABLE generated_cols (a int, b_gen int GENERATED ALWAYS AS (5 * a) STORED, c int);
+
+));
+
+my $publisher_connstr_d_cols = $node_publisher_d_cols->connstr . ' dbname=postgres';
+$node_subscriber_d_cols->safe_psql('postgres',
+	"CREATE SUBSCRIPTION sub_dropped_cols CONNECTION '$publisher_connstr_d_cols' PUBLICATION pub_dropped_cols"
+);
+$node_subscriber_d_cols->wait_for_subscription_sync;
+
+$node_publisher_d_cols->safe_psql(
+	'postgres', qq(
+		ALTER TABLE dropped_cols DROP COLUMN b_drop;
+));
+$node_subscriber_d_cols->safe_psql(
+	'postgres', qq(
+		ALTER TABLE dropped_cols DROP COLUMN b_drop;
+));
+
+$node_publisher_d_cols->safe_psql(
+	'postgres', qq(
+		UPDATE dropped_cols SET a = 100;
+		UPDATE generated_cols SET a = 100;
+));
+$node_publisher_d_cols->wait_for_catchup('sub_dropped_cols');
+
+is($node_subscriber_d_cols->safe_psql('postgres', "SELECT count(*) FROM dropped_cols WHERE a = 100"),
+	qq(1), 'replication with RI FULL and dropped columns');
+
+is($node_subscriber_d_cols->safe_psql('postgres', "SELECT count(*) FROM generated_cols WHERE a = 100"),
+	qq(1), 'replication with RI FULL and generated columns');
+
+$node_publisher_d_cols->stop('fast');
+$node_subscriber_d_cols->stop('fast');
+
 done_testing();
