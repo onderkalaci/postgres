@@ -1889,6 +1889,11 @@ postgresPlanForeignModify(PlannerInfo *root,
 							 returningList,
 							 &retrieved_attrs);
 			break;
+
+		case CMD_MERGE:
+			elog(ERROR, "MERGE is not supported by postgres_fdw");
+			break;
+
 		default:
 			elog(ERROR, "unexpected operation: %d", (int) operation);
 			break;

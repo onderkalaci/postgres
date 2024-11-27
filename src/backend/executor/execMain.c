@@ -1117,6 +1117,19 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
 								 errmsg("foreign table \"%s\" does not allow deletes",
 										RelationGetRelationName(resultRel))));
 					break;
+
+				case CMD_MERGE:
+
+					/*
+					 * ExecMerge() doesn't support foreign tables, so we
+					 * shouldn't allow here as well.
+					 */
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot merge into foreign table \"%s\"",
+									RelationGetRelationName(resultRel))));
+					break;
+
 				default:
 					elog(ERROR, "unrecognized CmdType: %d", (int) operation);
 					break;
