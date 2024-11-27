@@ -349,6 +349,14 @@ tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
 			continue;
 
 		/*
+		 * Ignore dropped and generated columns as the publisher doesn't
+		 * send those
+		 */
+		att = TupleDescAttr(slot1->tts_tupleDescriptor, attrnum);
+		if (att->attisdropped || att->attgenerated)
+			continue;
+
+		/*
 		 * If one value is NULL and other is not, then they are certainly not
 		 * equal
 		 */
