@@ -7234,24 +7234,6 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 		}
 
 		/*
-		 * MERGE is not currently supported for foreign tables.  We already
-		 * checked that when the table mentioned in the query is foreign; but
-		 * we can still get here if a partitioned table has a foreign table as
-		 * partition.  Disallow that now, to avoid an uglier error message
-		 * later.
-		 */
-		if (operation == CMD_MERGE && fdwroutine != NULL)
-		{
-			RangeTblEntry *rte = planner_rt_fetch(rti, root);
-
-			ereport(ERROR,
-					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					errmsg("cannot execute MERGE on relation \"%s\"",
-						   get_rel_name(rte->relid)),
-					errdetail_relkind_not_supported(rte->relkind));
-		}
-
-		/*
 		 * Try to modify the foreign table directly if (1) the FDW provides
 		 * callback functions needed for that and (2) there are no local
 		 * structures that need to be run for each modified row: row-level
